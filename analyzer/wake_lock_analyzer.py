@@ -190,7 +190,28 @@ class WakeLockAnalyzer:
 
     def _parse_binary_manifest(self, data: bytes, result: AnalysisResult) -> None:
         """Extract useful strings from binary AndroidManifest.xml."""
-        # Decode as latin-1 to preserve byte values, then search for ASCII strings
+        # Android binary XML (AXML) stores strings as UTF-16LE in the string pool.
+        # A plain latin-1 decode won't match ASCII permission strings because each
+        # character is interleaved with a null byte.  Check the raw bytes directly.
+        if WAKE_LOCK_PERMISSION.encode("utf-16-le") in data:
+            result.has_wake_lock_permission = True
+
+        # Try to recover package name / label from the UTF-16LE string pool.
+        try:
+            utf16_text = data.decode("utf-16-le", errors="ignore")
+            if not result.package_name:
+                pkg_match = re.search(r'package="([^"]+)"', utf16_text)
+                if pkg_match:
+                    result.package_name = pkg_match.group(1)
+            if not result.app_label:
+                label_match = re.search(r'android:label="([^"]+)"', utf16_text)
+                if label_match:
+                    result.app_label = label_match.group(1)
+        except Exception:
+            pass
+
+        # Also fall back to the latin-1 regex scan (catches UTF-8 string pools
+        # and picks up any remaining fields not yet populated above).
         text = data.decode("latin-1")
         self._regex_scan_manifest(text, result)
 
