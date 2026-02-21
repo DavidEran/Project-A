@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <!-- Title -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Wake Lock Tester"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Permission status -->
+        <TextView
+            android:id="@+id/tv_permission_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:padding="8dp"
+            android:background="#F0F0F0"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Tag input -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Wake Lock Tag:"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/et_tag"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="WakeLockTester:DefaultLock"
+            android:inputType="text"
+            android:maxLines="1"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Timeout input -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Timeout (ms) — leave blank for indefinite:"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/et_timeout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 60000"
+            android:inputType="numberDecimal"
+            android:maxLines="1"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Buttons -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/btn_acquire"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Acquire"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/btn_release"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Release"
+                android:enabled="false"
+                android:layout_marginStart="4dp" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btn_release_all"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Release All"
+            android:enabled="false"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Status line -->
+        <TextView
+            android:id="@+id/tv_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="14sp"
+            android:gravity="center"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Live duration -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Active Lock(s):"
+            android:textStyle="bold"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/tv_duration"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No active wake lock"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:layout_marginBottom="16dp"
+            android:padding="8dp"
+            android:background="#F8F8F8" />
+
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#CCCCCC"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Session history -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Session History:"
+                android:textStyle="bold"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btn_clear_history"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Clear"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_history"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No completed sessions yet."
+            android:textSize="13sp"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:background="#F8F8F8"
+            android:layout_marginBottom="16dp" />
+
+    </LinearLayout>
+</ScrollView>

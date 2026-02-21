@@ -1,0 +1,6 @@
+# No third-party dependencies required.
+# The analyzer uses only Python standard library modules:
+#   - zipfile, xml.etree.ElementTree, argparse, re, json, os, sys, pathlib, dataclasses
+#
+# For running tests:
+# pytest>=7.0
