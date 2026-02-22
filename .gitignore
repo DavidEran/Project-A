@@ -1,0 +1,7 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary APK files from check_play_integrity.sh
+/tmp/play_integrity_check_*.apk
