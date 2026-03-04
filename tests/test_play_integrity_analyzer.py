@@ -104,6 +104,15 @@ DEX_PLAY_RECOGNIZED = b"PLAY_RECOGNIZED\n"
 # SafetyNet class reference (legacy)
 DEX_SAFETYNET = b"Lcom/google/android/gms/safetynet/SafetyNetClient;\n"
 
+# --- Library 1.3+ paths (without 'core' in the package) ---
+DEX_NEW_CLASSIC_FACTORY  = b"Lcom/google/android/play/integrity/IntegrityManagerFactory;\n"
+DEX_NEW_CLASSIC_MANAGER  = b"Lcom/google/android/play/integrity/IntegrityManager;\n"
+DEX_NEW_STANDARD_MANAGER = b"Lcom/google/android/play/integrity/StandardIntegrityManager;\n"
+DEX_NEW_STANDARD_PROVIDER = b"Lcom/google/android/play/integrity/StandardIntegrityTokenProvider;\n"
+
+# requestAndShowDialog – Standard API dialog-based flow (library 1.2+)
+DEX_REQUEST_SHOW_DIALOG  = b"requestAndShowDialog\n"
+
 
 # ---------------------------------------------------------------------------
 # Tests: sideload_risk property
@@ -549,6 +558,118 @@ class TestMultiDex(unittest.TestCase):
             self.assertEqual(result.files_analyzed, 2)
         finally:
             os.unlink(tmp)
+
+
+# ---------------------------------------------------------------------------
+# Tests: library 1.3+ paths (without 'core' in package)
+# These were the source of false-negatives: the pre-check filter only matched
+# "play/core/integrity", so DEX files from newer library builds were silently
+# skipped and the APK was incorrectly reported as having no Play Integrity.
+# ---------------------------------------------------------------------------
+
+class TestNewStyleClassicApi(unittest.TestCase):
+    """Classic API classes at the restructured path (library 1.3+)."""
+
+    def test_new_factory_class_detected(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_CLASSIC_FACTORY)
+        self.assertTrue(result.uses_play_integrity)
+        self.assertTrue(result.uses_classic_api)
+
+    def test_new_manager_class_detected(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_CLASSIC_MANAGER)
+        self.assertTrue(result.uses_classic_api)
+
+    def test_new_no_standard_flag_when_only_classic(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_CLASSIC_FACTORY)
+        self.assertFalse(result.uses_standard_api)
+
+    def test_new_classic_with_token_request(self):
+        dex = DEX_NEW_CLASSIC_MANAGER + DEX_REQUEST_TOKEN
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.requests_token)
+
+    def test_new_classic_high_risk_full_pattern(self):
+        dex = (
+            DEX_NEW_CLASSIC_FACTORY
+            + DEX_REQUEST_TOKEN
+            + DEX_UNRECOGNIZED_VERSION
+            + DEX_VERDICT_FIELD
+        )
+        result = analyze(make_manifest("com.target.app"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+
+class TestNewStyleStandardApi(unittest.TestCase):
+    """Standard API classes at the restructured path (library 1.3+)."""
+
+    def test_new_standard_manager_detected(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_STANDARD_MANAGER)
+        self.assertTrue(result.uses_play_integrity)
+        self.assertTrue(result.uses_standard_api)
+
+    def test_new_standard_provider_detected(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_STANDARD_PROVIDER)
+        self.assertTrue(result.uses_standard_api)
+
+    def test_new_no_classic_flag_when_only_standard(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_STANDARD_MANAGER)
+        self.assertFalse(result.uses_classic_api)
+
+    def test_new_standard_with_prepare_token(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_PREPARE_TOKEN
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.requests_token)
+
+    def test_new_standard_high_risk_full_pattern(self):
+        dex = (
+            DEX_NEW_STANDARD_MANAGER
+            + DEX_PREPARE_TOKEN
+            + DEX_UNRECOGNIZED_VERSION
+            + DEX_VERDICT_FIELD
+        )
+        result = analyze(make_manifest("com.target.app"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+
+class TestRequestAndShowDialog(unittest.TestCase):
+    """requestAndShowDialog – dialog-based integrity flow (library 1.2+)."""
+
+    def test_request_show_dialog_sets_requests_token(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.requests_token)
+
+    def test_request_show_dialog_old_path(self):
+        dex = DEX_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.requests_token)
+
+    def test_request_show_dialog_sets_play_integrity(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.uses_play_integrity)
+
+
+class TestPreCheckFilter(unittest.TestCase):
+    """Verify the DEX pre-check accepts both old and new library paths."""
+
+    def test_old_path_not_silently_skipped(self):
+        """DEX with only old-style (play/core/integrity) path must be scanned."""
+        result = analyze(make_manifest("com.ex"), dex=DEX_CLASSIC_FACTORY)
+        self.assertTrue(result.uses_play_integrity,
+                        "Old-style path was silently skipped by the pre-check filter")
+
+    def test_new_path_not_silently_skipped(self):
+        """DEX with only new-style (play/integrity) path must be scanned."""
+        result = analyze(make_manifest("com.ex"), dex=DEX_NEW_CLASSIC_FACTORY)
+        self.assertTrue(result.uses_play_integrity,
+                        "New-style path was silently skipped by the pre-check filter")
+
+    def test_unrelated_dex_still_skipped(self):
+        """DEX with no Play Integrity content should report no usage."""
+        result = analyze(make_manifest("com.ex"), dex=b"just some random dex content here")
+        self.assertFalse(result.uses_play_integrity)
+        self.assertFalse(result.uses_safetynet)
 
 
 if __name__ == "__main__":

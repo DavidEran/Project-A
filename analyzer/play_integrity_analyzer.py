@@ -30,24 +30,38 @@ import xml.etree.ElementTree as ET
 # ---------------------------------------------------------------------------
 
 # Classic Play Integrity API (com.google.android.play:integrity library)
+# Includes both the original 'core' path (library <1.3) and the restructured
+# path without 'core' introduced in library 1.3+.
 CLASSIC_API_INDICATORS = [
+    # library < 1.3 (original package layout)
     "com/google/android/play/core/integrity/IntegrityManager",
     "com/google/android/play/core/integrity/IntegrityManagerFactory",
     "com/google/android/play/core/integrity/IntegrityTokenRequest",
     "com/google/android/play/core/integrity/IntegrityTokenResponse",
+    # library 1.3+ (restructured – 'core' removed from path)
+    "com/google/android/play/integrity/IntegrityManager",
+    "com/google/android/play/integrity/IntegrityManagerFactory",
+    "com/google/android/play/integrity/IntegrityTokenRequest",
+    "com/google/android/play/integrity/IntegrityTokenResponse",
 ]
 
 # Standard (newer) Play Integrity API – preferred since Play Integrity 1.1
 STANDARD_API_INDICATORS = [
+    # library < 1.3
     "com/google/android/play/core/integrity/StandardIntegrityManager",
     "com/google/android/play/core/integrity/StandardIntegrityTokenProvider",
     "com/google/android/play/core/integrity/StandardIntegrityTokenRequest",
+    # library 1.3+
+    "com/google/android/play/integrity/StandardIntegrityManager",
+    "com/google/android/play/integrity/StandardIntegrityTokenProvider",
+    "com/google/android/play/integrity/StandardIntegrityTokenRequest",
 ]
 
 # Method names that trigger an integrity check
 REQUEST_METHOD_INDICATORS = [
     "requestIntegrityToken",
-    "prepareIntegrityToken",   # Standard API warm-up call
+    "prepareIntegrityToken",    # Standard API warm-up call
+    "requestAndShowDialog",     # Standard API dialog-based flow (library 1.2+)
 ]
 
 # Verdict-related strings that indicate the app inspects the integrity response.
@@ -296,7 +310,11 @@ class PlayIntegrityAnalyzer:
         text = data.decode("latin-1")
 
         # Fast pre-check: skip DEX files with no relevant strings at all.
-        if not any(s in text for s in ["play/core/integrity", "SafetyNet", "safetynet"]):
+        # "play/core/integrity" matches the original library layout (<1.3).
+        # "play/integrity"      matches the restructured layout (1.3+) where
+        #                       'core' was removed from the package path.
+        # Both are needed: "play/integrity" is NOT a substring of "play/core/integrity".
+        if not any(s in text for s in ["play/core/integrity", "play/integrity", "SafetyNet", "safetynet"]):
             return
 
         # Track what we've already recorded from this file to avoid flooding
