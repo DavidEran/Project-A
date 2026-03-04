@@ -121,6 +121,27 @@ PLAY_STORE_HTML = """
     <a href="https://example.com/terms-of-service">Terms of Service</a>
     <a href="https://play.google.com/about/play-terms">Google Play Terms</a>
   </div>
+  <script>
+  AF_initDataCallback({key: 'ds:5', data: [[[
+    ["Visit website","https:\\/\\/example.com\\/",[[[1,[1]]]]],
+    ["Privacy policy","https:\\/\\/example.com\\/privacy-policy",[[[1,[1]]]]],
+    ["Email developer","support@example.com",[[[1,[1]]]]]
+  ]]]});
+  </script>
+</body>
+</html>
+"""
+
+# HTML served by the developer's homepage (mocked in integration tests).
+DEVELOPER_WEBSITE_HTML = """
+<html>
+<head><title>Example App</title></head>
+<body>
+  <nav>
+    <a href="/privacy-policy">Privacy Policy</a>
+    <a href="/terms-of-service">Terms &amp; Conditions</a>
+  </nav>
+  <h1>Welcome</h1>
 </body>
 </html>
 """
@@ -632,6 +653,7 @@ class TestPlayUrlAnalysis(unittest.TestCase):
             self.PLAY_URL,
             {
                 self.PLAY_PAGE: PLAY_STORE_HTML,
+                "https://example.com/": DEVELOPER_WEBSITE_HTML,
                 "https://example.com/privacy-policy": PRIVACY_POLICY_TEXT,
                 "https://example.com/terms-of-service": TERMS_TEXT,
             },
@@ -643,6 +665,7 @@ class TestPlayUrlAnalysis(unittest.TestCase):
             self.PLAY_URL,
             {
                 self.PLAY_PAGE: PLAY_STORE_HTML,
+                "https://example.com/": DEVELOPER_WEBSITE_HTML,
                 "https://example.com/privacy-policy": PRIVACY_POLICY_TEXT,
                 "https://example.com/terms-of-service": TERMS_TEXT,
             },
@@ -654,6 +677,7 @@ class TestPlayUrlAnalysis(unittest.TestCase):
             self.PLAY_URL,
             {
                 self.PLAY_PAGE: PLAY_STORE_HTML,
+                "https://example.com/": DEVELOPER_WEBSITE_HTML,
                 "https://example.com/privacy-policy": PRIVACY_POLICY_TEXT,
                 "https://example.com/terms-of-service": TERMS_TEXT,
             },

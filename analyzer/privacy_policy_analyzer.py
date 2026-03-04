@@ -59,6 +59,11 @@ PERSONAL_DATA_CATEGORIES: dict[str, list[str]] = {
         "device id", "device identifier", "imei", "imsi", "mac address",
         "ip address", "advertising id", "android id", "hardware identifier",
         "unique identifier", "device information",
+        # Explicit advertising / platform identifier phrases
+        "unique device identifier", "identifier for advertising",
+        "advertising identifier", "google advertiser id",
+        "apple id for advertising", "idfa", "gaid",
+        "google advertising id",
     ],
     "financial": [
         "payment information", "credit card", "debit card", "billing information",
@@ -134,6 +139,7 @@ TERMS_URL_PATTERNS = [
     r"terms[_\-]?of[_\-]?service",
     r"terms[_\-]?of[_\-]?use",
     r"terms[_\-]?and[_\-]?conditions",
+    r"terms[_\-]?conditions",
     r"termsofservice",
     r"termsofuse",
     r"\btos\b",
@@ -151,7 +157,27 @@ TERMS_LINK_TEXT = [
 
 # Minimum number of personal data categories that must be disclosed for
 # the privacy policy to be considered informative.
-MIN_DATA_CATEGORIES = 2
+MIN_DATA_CATEGORIES = 1
+
+# Phrases that indicate the developer explicitly declares they collect no
+# personal data.  When matched, check 3 is treated as passed (the
+# disclosure IS "we collect nothing").
+NO_DATA_COLLECTION_PHRASES = [
+    "we do not collect",
+    "we don't collect",
+    "we do not store",
+    "we don't store",
+    "no personal information is collected",
+    "no personal data is collected",
+    "no personal information collected",
+    "no personally identifiable information",
+    "does not collect any personal",
+    "do not collect any personal",
+    "not collect or store",
+    "we collect no personal",
+    "no data is collected",
+    "no information is collected",
+]
 
 # HTTP request timeout in seconds
 HTTP_TIMEOUT = 15
@@ -197,12 +223,22 @@ class PrivacyPolicyResult:
     # Check 3: Personal data disclosure
     discloses_collected_data: bool = False
     disclosed_data_categories: list = field(default_factory=list)  # category names found
+    # True when the policy explicitly declares that no personal data is
+    # collected (rather than simply not mentioning any categories).
+    declares_no_data_collection: bool = False
 
     # Supporting data
     all_policy_urls_found: list = field(default_factory=list)   # all candidate privacy URLs
     all_terms_urls_found: list = field(default_factory=list)    # all candidate terms URLs
     findings: list = field(default_factory=list)                # PolicyFinding objects
     errors: list = field(default_factory=list)
+    # URLs whose identity is confirmed by an authoritative label (e.g. the
+    # Play Store "Privacy Policy" link).  Content-check failures are ignored
+    # for these — the label itself is sufficient confirmation.
+    trusted_policy_urls: set = field(default_factory=set)
+    # Same for T&C: URLs whose link text explicitly said "Terms & Conditions"
+    # (or equivalent) on the developer's own website.
+    trusted_terms_urls: set = field(default_factory=set)
 
     @property
     def compliance_score(self) -> str:
@@ -233,6 +269,7 @@ class PrivacyPolicyResult:
                 "terms_url": self.terms_url,
                 "discloses_collected_data": self.discloses_collected_data,
                 "disclosed_data_categories": self.disclosed_data_categories,
+                "declares_no_data_collection": self.declares_no_data_collection,
             },
             "all_privacy_urls_found": self.all_policy_urls_found,
             "all_terms_urls_found": self.all_terms_urls_found,
@@ -366,6 +403,103 @@ def _resolve_url(href: str, base_url: str) -> str:
     return urllib.parse.urljoin(base_url, href)
 
 
+def _extract_play_store_support_urls(
+    html: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract (privacy_policy_url, developer_website_url) from a raw Play Store
+    HTML page.
+
+    Strategy (mirrors what a user sees on the Play Store page):
+      - The link labelled "Privacy Policy" IS the app's privacy policy.
+        Google mandates it, so it is always present.  The label alone
+        is sufficient — we do not inspect the URL shape at all.
+      - The link labelled "Website" is the developer's homepage.  We
+        fetch that page separately to find T&C.
+
+    Google Play embeds these as JSON strings in <script> tags.  The URL
+    may appear before or after its label, so we use nearest-neighbour
+    matching: find the non-Google quoted URL sitting closest (in either
+    direction) to the label text in the raw HTML.
+    """
+    # Play Store JSON encodes forward-slashes as \/ (e.g. "https:\/\/example.com").
+    # Normalise before any processing so the URL regex matches them.
+    html = html.replace('\\/', '/')
+
+    QUOTED_URL = re.compile(r'"(https?://[^"\s]{8,})"')
+
+    # Index all non-Google quoted URLs once.
+    all_candidates: list[tuple[int, str]] = [
+        (m.start(), m.group(1))
+        for m in QUOTED_URL.finditer(html)
+        if not _is_google_url(m.group(1))
+    ]
+
+    def _nearest(
+        keywords: list,
+        candidates: list,
+        max_dist: int = 1000,
+    ) -> Optional[str]:
+        best_url: Optional[str] = None
+        best_dist = max_dist + 1
+        for keyword in keywords:
+            for km in re.finditer(re.escape(keyword), html, re.IGNORECASE):
+                kpos = km.start()
+                for upos, url in candidates:
+                    dist = abs(upos - kpos)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_url = url
+        return best_url
+
+    # PP: label is the signal, no URL-pattern filtering needed.
+    pp_url = _nearest(
+        ["privacy policy", "privacypolicy", "privacy_policy"],
+        all_candidates,
+    )
+
+    # Website: skip URLs that look like policy pages so we get the homepage.
+    web_candidates = [
+        (upos, url) for upos, url in all_candidates
+        if not _url_matches_privacy(url) and not _url_matches_terms(url)
+    ]
+    website_url = _nearest(
+        # Play Store renders "Visit website" as the App Support button label;
+        # older/alternate renders may use "Website" or "Developer website".
+        ['"Visit website"', '"website"', "developer website", "visit website"],
+        web_candidates,
+        max_dist=1200,
+    )
+
+    return pp_url, website_url
+
+
+# Domains owned by Google that should never be treated as an app's own
+# privacy policy or T&C source.
+_GOOGLE_DOMAINS = frozenset({
+    "google.com",
+    "googlepolicies.com",
+    "googleapis.com",
+    "gstatic.com",
+    "android.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "ggpht.com",
+    "g.co",
+    "googleusercontent.com",
+    "youtube.com",
+})
+
+
+def _is_google_url(url: str) -> bool:
+    """Return True if the URL belongs to a Google-owned domain."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+        return any(host == gd or host.endswith("." + gd) for gd in _GOOGLE_DOMAINS)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Content analysis
 # ---------------------------------------------------------------------------
@@ -395,6 +529,16 @@ def _detect_disclosed_data_categories(text: str) -> list[str]:
         if any(kw in low for kw in keywords):
             found.append(category)
     return found
+
+
+def _declares_no_personal_data_collected(text: str) -> bool:
+    """
+    Return True if the text contains an explicit declaration that no
+    personal data is collected (e.g. "We do not collect any personal
+    information").
+    """
+    low = text.lower()
+    return any(phrase in low for phrase in NO_DATA_COLLECTION_PHRASES)
 
 
 # ---------------------------------------------------------------------------
@@ -640,37 +784,86 @@ class PrivacyPolicyAnalyzer:
             app_name = re.sub(r"\s*[-–|].*$", "", title).strip()
             result.app_label = app_name
 
+        # Extract the Privacy Policy URL and developer Website URL directly from
+        # the App Support section data embedded in the Play Store page.
+        # This is the only trusted source — broad scanning of the page HTML picks
+        # up SDK EULAs, Google's own policies, and other irrelevant URLs.
+        pp_url, website_url = _extract_play_store_support_urls(html)
+
+        if pp_url:
+            if self.verbose:
+                print(f"  App Support PP URL: {pp_url}")
+            self._record_privacy_url(pp_url, "Play Store App Support", result)
+            # This URL carries an explicit "Privacy Policy" label from Google
+            # Play — content-check failure must not override that confirmation.
+            result.trusted_policy_urls.add(pp_url)
+        else:
+            result.errors.append(
+                "Could not locate Privacy Policy URL in Play Store App Support section"
+            )
+
+        if website_url:
+            if self.verbose:
+                print(f"  App Support website: {website_url}")
+            self._fetch_developer_website(website_url, result)
+        else:
+            result.errors.append(
+                "Could not locate developer Website URL in Play Store App Support section"
+            )
+
+    def _fetch_developer_website(
+        self, dev_url: str, result: PrivacyPolicyResult
+    ) -> None:
+        """
+        Fetch the developer's homepage and extract privacy policy / T&C links.
+        All Google-owned URLs are ignored.
+        """
+        if self.verbose:
+            print(f"  Fetching developer website: {dev_url}")
+        html = _fetch_url(dev_url)
+        if html is None:
+            result.errors.append(f"Could not fetch developer website: {dev_url}")
+            return
+
         links = _extract_links_from_html(html)
         for href, text in links:
             if not href:
                 continue
-            full_url = _resolve_url(href, play_url)
+            full_url = _resolve_url(href, dev_url)
+            if _is_google_url(full_url):
+                continue
             if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
-                # Skip Play Store's own global privacy policy
-                if "policies.google.com" in full_url and "play.google.com" not in full_url:
-                    continue
-                self._record_privacy_url(full_url, "Play Store listing", result)
+                self._record_privacy_url(full_url, "Developer website", result)
             elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
-                self._record_terms_url(full_url, "Play Store listing", result)
+                self._record_terms_url(full_url, "Developer website", result)
+                # If the link text itself said "Terms & Conditions" (or similar),
+                # trust it — the label is the confirmation, same as the Play Store
+                # "Privacy Policy" label.
+                if _text_matches_terms_link(text):
+                    result.trusted_terms_urls.add(full_url)
 
-        # Also scan raw HTML for URLs via regex (catches JSON-LD / embedded data)
-        self._scan_text_for_urls("Play Store HTML", html, result)
+        # Also catch URLs embedded as plain text / in JSON inside the page
+        self._scan_text_for_urls("Developer website", html, result, skip_google=True)
 
     # ------------------------------------------------------------------
     # URL scanning helpers
     # ------------------------------------------------------------------
 
     def _scan_text_for_urls(
-        self, source_label: str, text: str, result: PrivacyPolicyResult
+        self, source_label: str, text: str, result: PrivacyPolicyResult,
+        skip_google: bool = False,
+        skip_terms: bool = False,
     ) -> None:
         """Extract all https?:// URLs from text and classify privacy/terms ones."""
         urls = re.findall(r"https?://[^\s\"'<>\\,\x00-\x1f]{10,}", text)
         for url in urls:
             # Strip trailing punctuation that is likely not part of the URL
             url = url.rstrip(".,;:)'\"")
+            if skip_google and _is_google_url(url):
+                continue
             if _url_matches_privacy(url):
                 self._record_privacy_url(url, source_label, result)
-            elif _url_matches_terms(url):
+            elif not skip_terms and _url_matches_terms(url):
                 self._record_terms_url(url, source_label, result)
 
     def _record_privacy_url(
@@ -736,21 +929,45 @@ class PrivacyPolicyAnalyzer:
 
         plain = _extract_text_from_html(content)
 
-        if _is_privacy_policy_document(plain):
+        trusted = url in result.trusted_policy_urls
+        if _is_privacy_policy_document(plain) or trusted:
             result.has_privacy_policy = True
             if not result.privacy_policy_url:
                 result.privacy_policy_url = url
-            result.findings.append(PolicyFinding(
-                source="HTTP fetch",
-                finding_type="privacy_url",
-                detail=f"Confirmed privacy policy document at: {url}",
-                url=url,
-            ))
+            if not trusted:
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="privacy_url",
+                    detail=f"Confirmed privacy policy document at: {url}",
+                    url=url,
+                ))
             categories = _detect_disclosed_data_categories(plain)
             self._record_data_categories(categories, url, result)
+
+            if not categories and _declares_no_personal_data_collected(plain):
+                result.declares_no_data_collection = True
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="data_category",
+                    detail="Policy explicitly declares no personal data is collected",
+                    url=url,
+                ))
+
+            # Fallback: the privacy policy page sometimes links to the T&C.
+            # Scan it for T&C links (skip Google URLs).
+            if not result.all_terms_urls_found:
+                pp_links = _extract_links_from_html(content)
+                for href, link_text in pp_links:
+                    if not href:
+                        continue
+                    full = _resolve_url(href, url)
+                    if _is_google_url(full):
+                        continue
+                    if _text_matches_terms_link(link_text) or _url_matches_terms(full):
+                        self._record_terms_url(full, "Privacy policy page", result)
         else:
             result.errors.append(
-                f"URL matched privacy pattern but content does not look like a "
+                f"Fetched privacy URL but content does not look like a "
                 f"privacy policy: {url}"
             )
 
@@ -764,19 +981,21 @@ class PrivacyPolicyAnalyzer:
 
         plain = _extract_text_from_html(content)
 
-        if _is_terms_document(plain):
+        trusted = url in result.trusted_terms_urls
+        if _is_terms_document(plain) or trusted:
             result.has_terms_and_conditions = True
             if not result.terms_url:
                 result.terms_url = url
-            result.findings.append(PolicyFinding(
-                source="HTTP fetch",
-                finding_type="terms_url",
-                detail=f"Confirmed T&C document at: {url}",
-                url=url,
-            ))
+            if not trusted:
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="terms_url",
+                    detail=f"Confirmed T&C document at: {url}",
+                    url=url,
+                ))
         else:
             result.errors.append(
-                f"URL matched T&C pattern but content does not look like a "
+                f"Fetched T&C URL but content does not look like a "
                 f"T&C document: {url}"
             )
 
@@ -810,9 +1029,12 @@ class PrivacyPolicyAnalyzer:
                 result.has_terms_and_conditions = True
                 result.terms_url = result.all_terms_urls_found[0]
 
-        # Determine data disclosure sufficiency
+        # Determine data disclosure sufficiency.
+        # A developer who explicitly declares "we collect nothing" also passes —
+        # that declaration IS the required disclosure.
         result.discloses_collected_data = (
             len(result.disclosed_data_categories) >= MIN_DATA_CATEGORIES
+            or result.declares_no_data_collection
         )
 
 
@@ -878,6 +1100,8 @@ def print_report(result: PrivacyPolicyResult, verbose: bool = False) -> None:
         print(f"      Data categories disclosed ({len(result.disclosed_data_categories)}):")
         for cat in result.disclosed_data_categories:
             print(f"        - {cat}")
+    elif result.declares_no_data_collection:
+        print(f"      {GREEN}App developer declared no personal data is collected.{RESET}")
     elif result.has_privacy_policy:
         print(f"      {YELLOW}Warning: No personal data categories detected in the policy.{RESET}")
 
