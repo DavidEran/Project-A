@@ -792,16 +792,29 @@ class PrivacyPolicyAnalyzer:
                 browser = p.chromium.launch(headless=True)
             except Exception as exc:
                 if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
-                    # Browser binaries not yet downloaded (e.g. first run on a fresh
+                    # Browser binaries not yet downloaded (e.g. first run after
                     # deployment). Install them automatically and retry once.
                     import subprocess
                     if self.verbose:
                         print("  [browser] Chromium not found — running 'playwright install chromium' …")
-                    subprocess.run(
-                        [sys.executable, "-m", "playwright", "install", "chromium"],
-                        check=True,
-                    )
-                    browser = p.chromium.launch(headless=True)
+                    try:
+                        subprocess.run(
+                            [sys.executable, "-m", "playwright", "install", "chromium"],
+                            check=True,
+                            capture_output=True,
+                            timeout=180,
+                        )
+                    except Exception as install_exc:
+                        result.errors.append(
+                            f"Playwright browser install failed: {install_exc}. "
+                            "Run 'playwright install chromium' manually."
+                        )
+                        return
+                    try:
+                        browser = p.chromium.launch(headless=True)
+                    except Exception as retry_exc:
+                        result.errors.append(f"Could not launch browser after install: {retry_exc}")
+                        return
                 else:
                     result.errors.append(f"Could not launch browser: {exc}")
                     return
