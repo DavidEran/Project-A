@@ -134,6 +134,7 @@ TERMS_URL_PATTERNS = [
     r"terms[_\-]?of[_\-]?service",
     r"terms[_\-]?of[_\-]?use",
     r"terms[_\-]?and[_\-]?conditions",
+    r"terms[_\-]?conditions",
     r"termsofservice",
     r"termsofuse",
     r"\btos\b",
@@ -364,6 +365,32 @@ def _fetch_url(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[str]:
 def _resolve_url(href: str, base_url: str) -> str:
     """Resolve a potentially relative URL against a base URL."""
     return urllib.parse.urljoin(base_url, href)
+
+
+# Domains owned by Google that should never be treated as an app's own
+# privacy policy or T&C source.
+_GOOGLE_DOMAINS = frozenset({
+    "google.com",
+    "googlepolicies.com",
+    "googleapis.com",
+    "gstatic.com",
+    "android.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "ggpht.com",
+    "g.co",
+    "googleusercontent.com",
+    "youtube.com",
+})
+
+
+def _is_google_url(url: str) -> bool:
+    """Return True if the URL belongs to a Google-owned domain."""
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+        return any(host == gd or host.endswith("." + gd) for gd in _GOOGLE_DOMAINS)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -640,34 +667,128 @@ class PrivacyPolicyAnalyzer:
             app_name = re.sub(r"\s*[-–|].*$", "", title).strip()
             result.app_label = app_name
 
+        # Scan Play Store links — skip all Google-owned domains so we never
+        # pick up Google's own privacy policy or T&C as the app's policy.
         links = _extract_links_from_html(html)
         for href, text in links:
             if not href:
                 continue
             full_url = _resolve_url(href, play_url)
+            if _is_google_url(full_url):
+                continue
             if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
-                # Skip Play Store's own global privacy policy
-                if "policies.google.com" in full_url and "play.google.com" not in full_url:
-                    continue
                 self._record_privacy_url(full_url, "Play Store listing", result)
             elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
                 self._record_terms_url(full_url, "Play Store listing", result)
 
-        # Also scan raw HTML for URLs via regex (catches JSON-LD / embedded data)
-        self._scan_text_for_urls("Play Store HTML", html, result)
+        # Scan raw HTML for URLs embedded in JSON/script blocks (skip Google).
+        self._scan_text_for_urls("Play Store HTML", html, result, skip_google=True)
+
+        # Locate the developer's own website and scrape it for PP and T&C.
+        # This is the primary source of T&C which is almost never on Play Store.
+        developer_url = self._extract_developer_website(html, play_url)
+        if developer_url:
+            if self.verbose:
+                print(f"  Found developer website: {developer_url}")
+            self._fetch_developer_website(developer_url, result)
+
+    def _extract_developer_website(
+        self, html: str, base_url: str
+    ) -> Optional[str]:
+        """
+        Try to find the developer's own website URL inside the Play Store HTML.
+
+        Tries (in order):
+          1. JSON-LD structured data embedded in <script> tags.
+          2. An <a> link whose text contains "visit website" / "developer website".
+          3. A regex scan of the page's embedded JSON data for known keys.
+        """
+        # 1. JSON-LD
+        for json_str in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL | re.IGNORECASE,
+        ):
+            try:
+                data = json.loads(json_str)
+                for key in ("url", "website", "sameAs", "developerUrl"):
+                    val = data.get(key)
+                    if (
+                        isinstance(val, str)
+                        and val.startswith("http")
+                        and not _is_google_url(val)
+                    ):
+                        return val
+            except Exception:
+                pass
+
+        # 2. Explicit "visit website" / "developer website" anchor
+        website_keywords = (
+            "visit website", "developer website", "visit developer",
+            "app website", "official website",
+        )
+        for href, text in _extract_links_from_html(html):
+            tl = text.lower().strip()
+            if any(kw in tl for kw in website_keywords):
+                full = _resolve_url(href, base_url)
+                if full.startswith("http") and not _is_google_url(full):
+                    return full
+
+        # 3. JSON key scan in raw HTML
+        for pattern in (
+            r'"(?:developerWebsite|developerUrl|website)"\s*:\s*"(https?://[^"]{5,})"',
+        ):
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                url = m.group(1)
+                if not _is_google_url(url):
+                    return url
+
+        return None
+
+    def _fetch_developer_website(
+        self, dev_url: str, result: PrivacyPolicyResult
+    ) -> None:
+        """
+        Fetch the developer's homepage and extract privacy policy / T&C links.
+        All Google-owned URLs are ignored.
+        """
+        if self.verbose:
+            print(f"  Fetching developer website: {dev_url}")
+        html = _fetch_url(dev_url)
+        if html is None:
+            result.errors.append(f"Could not fetch developer website: {dev_url}")
+            return
+
+        links = _extract_links_from_html(html)
+        for href, text in links:
+            if not href:
+                continue
+            full_url = _resolve_url(href, dev_url)
+            if _is_google_url(full_url):
+                continue
+            if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
+                self._record_privacy_url(full_url, "Developer website", result)
+            elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
+                self._record_terms_url(full_url, "Developer website", result)
+
+        # Also catch URLs embedded as plain text / in JSON inside the page
+        self._scan_text_for_urls("Developer website", html, result, skip_google=True)
 
     # ------------------------------------------------------------------
     # URL scanning helpers
     # ------------------------------------------------------------------
 
     def _scan_text_for_urls(
-        self, source_label: str, text: str, result: PrivacyPolicyResult
+        self, source_label: str, text: str, result: PrivacyPolicyResult,
+        skip_google: bool = False,
     ) -> None:
         """Extract all https?:// URLs from text and classify privacy/terms ones."""
         urls = re.findall(r"https?://[^\s\"'<>\\,\x00-\x1f]{10,}", text)
         for url in urls:
             # Strip trailing punctuation that is likely not part of the URL
             url = url.rstrip(".,;:)'\"")
+            if skip_google and _is_google_url(url):
+                continue
             if _url_matches_privacy(url):
                 self._record_privacy_url(url, source_label, result)
             elif _url_matches_terms(url):
