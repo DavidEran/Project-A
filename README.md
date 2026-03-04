@@ -8,6 +8,8 @@ and, if so, for how long it holds wake locks.
 | Component | Purpose |
 |-----------|---------|
 | `analyzer/wake_lock_analyzer.py` | Python CLI — static analysis of APK files |
+| `analyzer/play_integrity_analyzer.py` | Python CLI — Play Integrity / sideload-risk analysis |
+| `analyzer/privacy_policy_analyzer.py` | Python CLI — privacy policy compliance analysis |
 | `android-app/` | Android app — runtime wake lock acquisition and timing |
 | `scripts/monitor_wake_locks.sh` | Shell script — live monitoring via ADB |
 | `scripts/check_apk_permission.sh` | Shell script — quick permission check via ADB |
@@ -193,6 +195,127 @@ Currently Held Wake Locks:
 
 ---
 
+---
+
+## 4. Privacy Policy Analyzer
+
+Checks whether an Android app complies with privacy policy requirements by
+analyzing either an **APK file** (static) or a **Google Play Store URL** (live).
+
+Three compliance checks are performed:
+
+| # | Check | Pass condition |
+|---|-------|----------------|
+| 1 | **Privacy policy present** | A privacy policy URL is found in the APK binary / Play listing, and the fetched page is confirmed to be a privacy policy document |
+| 2 | **Terms & Conditions present** | A T&C URL is found and confirmed |
+| 3 | **Personal data disclosure** | The privacy policy text mentions ≥ 2 personal data categories (identity, contact, location, device identifiers, financial, health, usage/analytics, communications, media, demographics, credentials) |
+
+**Overall verdict:**
+
+| Score | Meaning |
+|-------|---------|
+| `COMPLIANT` | All three checks passed |
+| `PARTIAL` | Privacy policy found but T&C or data-disclosure check failed |
+| `NON_COMPLIANT` | No privacy policy detected |
+
+### Requirements
+
+- Python 3.10+
+- No third-party libraries required (standard library only: `urllib`, `html.parser`, `zipfile`, `re`, …)
+- Internet access required when fetching remote policy URLs (APK mode) or the Play Store listing
+
+### Usage
+
+```bash
+# Analyze an APK file
+python3 analyzer/privacy_policy_analyzer.py app.apk
+
+# Analyze a Google Play Store listing
+python3 analyzer/privacy_policy_analyzer.py \
+    "https://play.google.com/store/apps/details?id=com.example.app"
+
+# Verbose (show each finding)
+python3 analyzer/privacy_policy_analyzer.py app.apk --verbose
+
+# JSON output
+python3 analyzer/privacy_policy_analyzer.py app.apk --json
+
+# Save JSON result to a file
+python3 analyzer/privacy_policy_analyzer.py app.apk --json --output result.json
+```
+
+### Example output
+
+```
+==============================================================
+  PRIVACY POLICY COMPLIANCE REPORT
+==============================================================
+  Source  : app.apk
+  Package : com.example.app
+  Label   : Example App
+==============================================================
+  Overall compliance: COMPLIANT
+
+  [1] Privacy policy present   : YES
+      URL : https://example.com/privacy-policy
+
+  [2] Terms & Conditions present: YES
+      URL : https://example.com/terms-of-service
+
+  [3] Privacy policy discloses personal data: YES
+      Data categories disclosed (5):
+        - identity
+        - contact
+        - location
+        - device_identifiers
+        - usage_analytics
+
+  All three checks passed.
+  The app has a privacy policy, T&C, and the policy discloses
+  which personal data is collected.
+
+  Files analyzed: 1
+==============================================================
+```
+
+### How APK scanning works
+
+1. **`AndroidManifest.xml`** — parsed for the `android:privacyPolicy` attribute
+   (Android 10+) and scanned for any embedded `https://` URLs.
+2. **`classes*.dex`** — decoded as latin-1 and scanned for URL strings containing
+   `privacy`, `terms`, `gdpr`, `eula`, etc.
+3. **`resources.arsc`** — raw binary scan for the same URL patterns (catches
+   string resources stored in the resource table).
+4. **`assets/*.html` / `assets/*.txt`** — text/HTML assets are parsed directly;
+   bundled privacy policy or T&C documents are detected and analysed without a
+   network request.
+5. Confirmed candidate URLs are then **fetched** to verify content and detect
+   personal-data category disclosures.
+
+### How Play Store scanning works
+
+1. The package ID is extracted from the `?id=` query parameter.
+2. The Play Store listing page is fetched (`https://play.google.com/store/apps/details?id=…&hl=en`).
+3. All `<a>` links are extracted; those whose text or `href` matches privacy /
+   terms patterns are recorded.
+4. Each candidate URL is fetched and its content is analysed.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0`  | `COMPLIANT` — all three checks passed |
+| `1`  | `PARTIAL` or `NON_COMPLIANT` |
+| `2`  | Input error (file not found, not a valid APK, etc.) |
+
+### Running the tests
+
+```bash
+python3 -m unittest tests/test_privacy_policy_analyzer.py -v
+```
+
+---
+
 ## Wake Lock primer
 
 | Concept | Details |
@@ -211,7 +334,9 @@ Currently Held Wake Locks:
 Project-A/
 ├── analyzer/
 │   ├── __init__.py
-│   └── wake_lock_analyzer.py    # Python CLI static analyzer
+│   ├── wake_lock_analyzer.py         # Python CLI static analyzer
+│   ├── play_integrity_analyzer.py    # Play Integrity / sideload-risk analyzer
+│   └── privacy_policy_analyzer.py   # Privacy policy compliance analyzer
 ├── android-app/
 │   ├── app/
 │   │   ├── build.gradle.kts
@@ -234,7 +359,8 @@ Project-A/
 │   ├── check_apk_permission.sh
 │   └── monitor_wake_locks.sh
 ├── tests/
-│   └── test_analyzer.py         # 30 Python unit tests
+│   ├── test_analyzer.py                    # Wake Lock Analyzer unit tests
+│   └── test_privacy_policy_analyzer.py     # Privacy Policy Analyzer unit tests
 ├── requirements.txt
 └── README.md
 ```
