@@ -374,66 +374,61 @@ def _extract_play_store_support_urls(
     Extract (privacy_policy_url, developer_website_url) from a raw Play Store
     HTML page.
 
-    Google Play embeds App Support data as JSON inside <script> tags.  The
-    ordering is not guaranteed: the URL may appear either *before* or *after*
-    its label in the raw HTML.  We therefore use a nearest-neighbour approach:
-    collect all candidate quoted URLs, find every occurrence of the relevant
-    label keywords, and return whichever URL sits closest (in either direction)
-    to any of those label occurrences.
+    Strategy (mirrors what a user sees on the Play Store page):
+      - The link labelled "Privacy Policy" IS the app's privacy policy.
+        Google mandates it, so it is always present.  The label alone
+        is sufficient — we do not inspect the URL shape at all.
+      - The link labelled "Website" is the developer's homepage.  We
+        fetch that page separately to find T&C.
+
+    Google Play embeds these as JSON strings in <script> tags.  The URL
+    may appear before or after its label, so we use nearest-neighbour
+    matching: find the non-Google quoted URL sitting closest (in either
+    direction) to the label text in the raw HTML.
     """
     QUOTED_URL = re.compile(r'"(https?://[^"\s]{8,})"')
 
-    # Index all non-Google quoted URLs with their byte positions.
-    candidates: list[tuple[int, str]] = []
-    for m in QUOTED_URL.finditer(html):
-        url = m.group(1)
-        if not _is_google_url(url):
-            candidates.append((m.start(), url))
+    # Index all non-Google quoted URLs once.
+    all_candidates: list[tuple[int, str]] = [
+        (m.start(), m.group(1))
+        for m in QUOTED_URL.finditer(html)
+        if not _is_google_url(m.group(1))
+    ]
 
-    def _nearest_url(
+    def _nearest(
         keywords: list,
+        candidates: list,
         max_dist: int = 1000,
-        require_privacy: bool = False,
-        exclude_privacy: bool = False,
-        exclude_terms: bool = False,
     ) -> Optional[str]:
-        """Return the non-Google quoted URL closest to any keyword occurrence."""
         best_url: Optional[str] = None
-        best_dist: int = max_dist + 1
-
+        best_dist = max_dist + 1
         for keyword in keywords:
             for km in re.finditer(re.escape(keyword), html, re.IGNORECASE):
                 kpos = km.start()
                 for upos, url in candidates:
                     dist = abs(upos - kpos)
-                    if dist >= best_dist:
-                        continue
-                    if require_privacy and not (
-                        _url_matches_privacy(url) or "privacy" in url.lower()
-                    ):
-                        continue
-                    if exclude_privacy and (
-                        _url_matches_privacy(url) or "privacy" in url.lower()
-                    ):
-                        continue
-                    if exclude_terms and _url_matches_terms(url):
-                        continue
-                    best_dist = dist
-                    best_url = url
-
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_url = url
         return best_url
 
-    pp_url = _nearest_url(
+    # PP: label is the signal, no URL-pattern filtering needed.
+    pp_url = _nearest(
         ["privacy policy", "privacypolicy", "privacy_policy"],
-        require_privacy=True,
-        max_dist=1000,
+        all_candidates,
     )
-    website_url = _nearest_url(
+
+    # Website: skip URLs that look like policy pages so we get the homepage.
+    web_candidates = [
+        (upos, url) for upos, url in all_candidates
+        if not _url_matches_privacy(url) and not _url_matches_terms(url)
+    ]
+    website_url = _nearest(
         ['"website"', "developer website"],
-        exclude_privacy=True,
-        exclude_terms=True,
+        web_candidates,
         max_dist=800,
     )
+
     return pp_url, website_url
 
 
