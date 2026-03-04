@@ -422,6 +422,10 @@ def _extract_play_store_support_urls(
     matching: find the non-Google quoted URL sitting closest (in either
     direction) to the label text in the raw HTML.
     """
+    # Play Store JSON encodes forward-slashes as \/ (e.g. "https:\/\/example.com").
+    # Normalise before any processing so the URL regex matches them.
+    html = html.replace('\\/', '/')
+
     QUOTED_URL = re.compile(r'"(https?://[^"\s]{8,})"')
 
     # Index all non-Google quoted URLs once.
