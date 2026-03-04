@@ -367,6 +367,68 @@ def _resolve_url(href: str, base_url: str) -> str:
     return urllib.parse.urljoin(base_url, href)
 
 
+def _extract_play_store_support_urls(
+    html: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract (privacy_policy_url, developer_website_url) from a raw Play Store
+    HTML page.
+
+    Google Play embeds all app data — including the App Support links — as JSON
+    values inside <script> tags.  We find the relevant URLs by scanning for
+    quoted URL strings that appear within a short window *after* the label that
+    identifies them ("Privacy policy", "Website", etc.).
+
+    This is deliberately narrow: we never accept a URL just because it looks
+    like a privacy/terms URL — it must appear adjacent to the right label in
+    the page data.
+    """
+    # Matches a JSON-quoted URL: "https://..."
+    QUOTED_URL = re.compile(r'"(https?://[^"\s]{8,})"')
+
+    def _first_url_after(
+        keywords: list,
+        window: int = 600,
+        require_privacy: bool = False,
+        exclude_privacy: bool = False,
+        exclude_terms: bool = False,
+    ) -> Optional[str]:
+        """Return first non-Google quoted URL within *window* chars of any keyword."""
+        for keyword in keywords:
+            for km in re.finditer(re.escape(keyword), html, re.IGNORECASE):
+                snippet = html[km.end(): km.end() + window]
+                for um in QUOTED_URL.finditer(snippet):
+                    url = um.group(1)
+                    if _is_google_url(url):
+                        continue
+                    if require_privacy and not (
+                        _url_matches_privacy(url) or "privacy" in url.lower()
+                    ):
+                        continue
+                    if exclude_privacy and (
+                        _url_matches_privacy(url) or "privacy" in url.lower()
+                    ):
+                        continue
+                    if exclude_terms and _url_matches_terms(url):
+                        continue
+                    return url
+        return None
+
+    pp_url = _first_url_after(
+        ["privacy policy", "privacypolicy", "privacy_policy"],
+        require_privacy=True,
+    )
+    # Use the JSON-key form "website" (with quotes) to target the data field,
+    # not every occurrence of the word "website" in the page text.
+    website_url = _first_url_after(
+        ['"website"', "developer website", "app support"],
+        window=400,
+        exclude_privacy=True,
+        exclude_terms=True,
+    )
+    return pp_url, website_url
+
+
 # Domains owned by Google that should never be treated as an app's own
 # privacy policy or T&C source.
 _GOOGLE_DOMAINS = frozenset({
@@ -667,89 +729,29 @@ class PrivacyPolicyAnalyzer:
             app_name = re.sub(r"\s*[-–|].*$", "", title).strip()
             result.app_label = app_name
 
-        # Scan Play Store links for the app's privacy policy only.
-        # T&C is intentionally NOT collected here: the Play Store page contains
-        # links to Google's own ToS and SDK EULAs (e.g. aka.ms/eula) that are
-        # irrelevant to the app's own terms. T&C comes exclusively from the
-        # developer's website below.
-        links = _extract_links_from_html(html)
-        for href, text in links:
-            if not href:
-                continue
-            full_url = _resolve_url(href, play_url)
-            if _is_google_url(full_url):
-                continue
-            if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
-                self._record_privacy_url(full_url, "Play Store listing", result)
+        # Extract the Privacy Policy URL and developer Website URL directly from
+        # the App Support section data embedded in the Play Store page.
+        # This is the only trusted source — broad scanning of the page HTML picks
+        # up SDK EULAs, Google's own policies, and other irrelevant URLs.
+        pp_url, website_url = _extract_play_store_support_urls(html)
 
-        # Scan raw HTML for PP URLs embedded in JSON/script blocks.
-        # skip_terms=True so random EULA/ToS links in embedded JS are ignored.
-        self._scan_text_for_urls(
-            "Play Store HTML", html, result, skip_google=True, skip_terms=True
-        )
-
-        # Locate the developer's own website and scrape it for PP and T&C.
-        # This is the primary source of T&C which is almost never on Play Store.
-        developer_url = self._extract_developer_website(html, play_url)
-        if developer_url:
+        if pp_url:
             if self.verbose:
-                print(f"  Found developer website: {developer_url}")
-            self._fetch_developer_website(developer_url, result)
+                print(f"  App Support PP URL: {pp_url}")
+            self._record_privacy_url(pp_url, "Play Store App Support", result)
+        else:
+            result.errors.append(
+                "Could not locate Privacy Policy URL in Play Store App Support section"
+            )
 
-    def _extract_developer_website(
-        self, html: str, base_url: str
-    ) -> Optional[str]:
-        """
-        Try to find the developer's own website URL inside the Play Store HTML.
-
-        Tries (in order):
-          1. JSON-LD structured data embedded in <script> tags.
-          2. An <a> link whose text contains "visit website" / "developer website".
-          3. A regex scan of the page's embedded JSON data for known keys.
-        """
-        # 1. JSON-LD
-        for json_str in re.findall(
-            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL | re.IGNORECASE,
-        ):
-            try:
-                data = json.loads(json_str)
-                for key in ("url", "website", "sameAs", "developerUrl"):
-                    val = data.get(key)
-                    if (
-                        isinstance(val, str)
-                        and val.startswith("http")
-                        and not _is_google_url(val)
-                    ):
-                        return val
-            except Exception:
-                pass
-
-        # 2. Explicit "visit website" / "developer website" anchor, or a
-        #    standalone "Website" label (as shown in Play Store "App support").
-        website_keywords = (
-            "visit website", "developer website", "visit developer",
-            "app website", "official website",
-        )
-        for href, text in _extract_links_from_html(html):
-            tl = text.lower().strip()
-            # Exact "website" match OR any of the longer keyword phrases
-            if tl == "website" or any(kw in tl for kw in website_keywords):
-                full = _resolve_url(href, base_url)
-                if full.startswith("http") and not _is_google_url(full):
-                    return full
-
-        # 3. JSON key scan in raw HTML
-        for pattern in (
-            r'"(?:developerWebsite|developerUrl|website)"\s*:\s*"(https?://[^"]{5,})"',
-        ):
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                url = m.group(1)
-                if not _is_google_url(url):
-                    return url
-
-        return None
+        if website_url:
+            if self.verbose:
+                print(f"  App Support website: {website_url}")
+            self._fetch_developer_website(website_url, result)
+        else:
+            result.errors.append(
+                "Could not locate developer Website URL in Play Store App Support section"
+            )
 
     def _fetch_developer_website(
         self, dev_url: str, result: PrivacyPolicyResult
