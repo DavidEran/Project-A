@@ -204,6 +204,10 @@ class PrivacyPolicyResult:
     all_terms_urls_found: list = field(default_factory=list)    # all candidate terms URLs
     findings: list = field(default_factory=list)                # PolicyFinding objects
     errors: list = field(default_factory=list)
+    # URLs whose identity is confirmed by an authoritative label (e.g. the
+    # Play Store "Privacy Policy" link).  Content-check failures are ignored
+    # for these — the label itself is sufficient confirmation.
+    trusted_policy_urls: set = field(default_factory=set)
 
     @property
     def compliance_score(self) -> str:
@@ -742,6 +746,9 @@ class PrivacyPolicyAnalyzer:
             if self.verbose:
                 print(f"  App Support PP URL: {pp_url}")
             self._record_privacy_url(pp_url, "Play Store App Support", result)
+            # This URL carries an explicit "Privacy Policy" label from Google
+            # Play — content-check failure must not override that confirmation.
+            result.trusted_policy_urls.add(pp_url)
         else:
             result.errors.append(
                 "Could not locate Privacy Policy URL in Play Store App Support section"
@@ -869,16 +876,18 @@ class PrivacyPolicyAnalyzer:
 
         plain = _extract_text_from_html(content)
 
-        if _is_privacy_policy_document(plain):
+        trusted = url in result.trusted_policy_urls
+        if _is_privacy_policy_document(plain) or trusted:
             result.has_privacy_policy = True
             if not result.privacy_policy_url:
                 result.privacy_policy_url = url
-            result.findings.append(PolicyFinding(
-                source="HTTP fetch",
-                finding_type="privacy_url",
-                detail=f"Confirmed privacy policy document at: {url}",
-                url=url,
-            ))
+            if not trusted:
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="privacy_url",
+                    detail=f"Confirmed privacy policy document at: {url}",
+                    url=url,
+                ))
             categories = _detect_disclosed_data_categories(plain)
             self._record_data_categories(categories, url, result)
 
@@ -896,7 +905,7 @@ class PrivacyPolicyAnalyzer:
                         self._record_terms_url(full, "Privacy policy page", result)
         else:
             result.errors.append(
-                f"URL matched privacy pattern but content does not look like a "
+                f"Fetched privacy URL but content does not look like a "
                 f"privacy policy: {url}"
             )
 
