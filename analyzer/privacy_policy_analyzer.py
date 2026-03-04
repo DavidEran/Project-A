@@ -667,8 +667,11 @@ class PrivacyPolicyAnalyzer:
             app_name = re.sub(r"\s*[-–|].*$", "", title).strip()
             result.app_label = app_name
 
-        # Scan Play Store links — skip all Google-owned domains so we never
-        # pick up Google's own privacy policy or T&C as the app's policy.
+        # Scan Play Store links for the app's privacy policy only.
+        # T&C is intentionally NOT collected here: the Play Store page contains
+        # links to Google's own ToS and SDK EULAs (e.g. aka.ms/eula) that are
+        # irrelevant to the app's own terms. T&C comes exclusively from the
+        # developer's website below.
         links = _extract_links_from_html(html)
         for href, text in links:
             if not href:
@@ -678,11 +681,12 @@ class PrivacyPolicyAnalyzer:
                 continue
             if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
                 self._record_privacy_url(full_url, "Play Store listing", result)
-            elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
-                self._record_terms_url(full_url, "Play Store listing", result)
 
-        # Scan raw HTML for URLs embedded in JSON/script blocks (skip Google).
-        self._scan_text_for_urls("Play Store HTML", html, result, skip_google=True)
+        # Scan raw HTML for PP URLs embedded in JSON/script blocks.
+        # skip_terms=True so random EULA/ToS links in embedded JS are ignored.
+        self._scan_text_for_urls(
+            "Play Store HTML", html, result, skip_google=True, skip_terms=True
+        )
 
         # Locate the developer's own website and scrape it for PP and T&C.
         # This is the primary source of T&C which is almost never on Play Store.
@@ -721,14 +725,16 @@ class PrivacyPolicyAnalyzer:
             except Exception:
                 pass
 
-        # 2. Explicit "visit website" / "developer website" anchor
+        # 2. Explicit "visit website" / "developer website" anchor, or a
+        #    standalone "Website" label (as shown in Play Store "App support").
         website_keywords = (
             "visit website", "developer website", "visit developer",
             "app website", "official website",
         )
         for href, text in _extract_links_from_html(html):
             tl = text.lower().strip()
-            if any(kw in tl for kw in website_keywords):
+            # Exact "website" match OR any of the longer keyword phrases
+            if tl == "website" or any(kw in tl for kw in website_keywords):
                 full = _resolve_url(href, base_url)
                 if full.startswith("http") and not _is_google_url(full):
                     return full
@@ -781,6 +787,7 @@ class PrivacyPolicyAnalyzer:
     def _scan_text_for_urls(
         self, source_label: str, text: str, result: PrivacyPolicyResult,
         skip_google: bool = False,
+        skip_terms: bool = False,
     ) -> None:
         """Extract all https?:// URLs from text and classify privacy/terms ones."""
         urls = re.findall(r"https?://[^\s\"'<>\\,\x00-\x1f]{10,}", text)
@@ -791,7 +798,7 @@ class PrivacyPolicyAnalyzer:
                 continue
             if _url_matches_privacy(url):
                 self._record_privacy_url(url, source_label, result)
-            elif _url_matches_terms(url):
+            elif not skip_terms and _url_matches_terms(url):
                 self._record_terms_url(url, source_label, result)
 
     def _record_privacy_url(
@@ -869,6 +876,19 @@ class PrivacyPolicyAnalyzer:
             ))
             categories = _detect_disclosed_data_categories(plain)
             self._record_data_categories(categories, url, result)
+
+            # Fallback: the privacy policy page sometimes links to the T&C.
+            # Scan it for T&C links (skip Google URLs).
+            if not result.all_terms_urls_found:
+                pp_links = _extract_links_from_html(content)
+                for href, link_text in pp_links:
+                    if not href:
+                        continue
+                    full = _resolve_url(href, url)
+                    if _is_google_url(full):
+                        continue
+                    if _text_matches_terms_link(link_text) or _url_matches_terms(full):
+                        self._record_terms_url(full, "Privacy policy page", result)
         else:
             result.errors.append(
                 f"URL matched privacy pattern but content does not look like a "
