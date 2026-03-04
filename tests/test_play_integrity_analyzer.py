@@ -25,6 +25,9 @@ from play_integrity_analyzer import (
     VERDICT_INDICATORS,
     SAFETYNET_INDICATORS,
     SIDELOAD_VERDICT,
+    SIDELOAD_VERDICTS,
+    REMEDIATION_INDICATORS,
+    INSTALLER_CHECK_INDICATORS,
 )
 
 
@@ -113,6 +116,18 @@ DEX_NEW_STANDARD_PROVIDER = b"Lcom/google/android/play/integrity/StandardIntegri
 # requestAndShowDialog – Standard API dialog-based flow (library 1.2+)
 DEX_REQUEST_SHOW_DIALOG  = b"requestAndShowDialog\n"
 
+# UNLICENSED – appLicensingVerdict for non-Play-licensed installs (Digital Turbine)
+DEX_UNLICENSED           = b"UNLICENSED\n"
+
+# Play Integrity remediation dialog type codes
+DEX_GET_LICENSED         = b"GET_LICENSED\n"
+DEX_CLOSE_UNKNOWN_SOURCE = b"CLOSE_UNKNOWN_SOURCE_DIALOG\n"
+
+# Installer source check strings
+DEX_GET_INSTALLER_PKG    = b"getInstallerPackageName\n"
+DEX_GET_INSTALL_SOURCE   = b"getInstallSourceInfo\n"
+DEX_PLAY_STORE_PKG       = b"com.android.vending\n"
+
 
 # ---------------------------------------------------------------------------
 # Tests: sideload_risk property
@@ -177,7 +192,9 @@ class TestSummaryKeys(unittest.TestCase):
             "apk", "package", "label",
             "uses_play_integrity", "uses_classic_api", "uses_standard_api",
             "uses_safetynet", "requests_token", "checks_verdict",
-            "checks_unrecognized_version", "has_play_core_components",
+            "checks_unrecognized_version", "checks_unlicensed",
+            "uses_remediation_dialog", "checks_installer_source",
+            "has_play_core_components",
             "sideload_risk", "files_analyzed", "errors", "usages",
         }
         self.assertEqual(set(s.keys()), expected)
@@ -648,6 +665,208 @@ class TestRequestAndShowDialog(unittest.TestCase):
         dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
         result = analyze(make_manifest("com.ex"), dex=dex)
         self.assertTrue(result.uses_play_integrity)
+
+
+# ---------------------------------------------------------------------------
+# Tests: UNLICENSED verdict (Digital Turbine / non-Play-licensed installs)
+# ---------------------------------------------------------------------------
+
+class TestUnlicensedVerdict(unittest.TestCase):
+    """UNLICENSED is the appLicensingVerdict for apps not licensed via Play Store.
+    Digital Turbine installs receive this verdict, so any app checking for it
+    will block Digital Turbine users and must be flagged HIGH."""
+
+    def test_unlicensed_sets_checks_unlicensed(self):
+        result = analyze(make_manifest("com.ex"),
+                         dex=DEX_CLASSIC_MANAGER + DEX_UNLICENSED)
+        self.assertTrue(result.checks_unlicensed)
+
+    def test_unlicensed_sets_checks_verdict(self):
+        result = analyze(make_manifest("com.ex"),
+                         dex=DEX_CLASSIC_MANAGER + DEX_UNLICENSED)
+        self.assertTrue(result.checks_verdict)
+
+    def test_unlicensed_does_not_set_checks_unrecognized(self):
+        result = analyze(make_manifest("com.ex"),
+                         dex=DEX_CLASSIC_MANAGER + DEX_UNLICENSED)
+        self.assertFalse(result.checks_unrecognized)
+
+    def test_high_risk_when_token_requested_and_unlicensed_checked(self):
+        dex = DEX_CLASSIC_FACTORY + DEX_REQUEST_TOKEN + DEX_UNLICENSED
+        result = analyze(make_manifest("com.target.app"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_high_risk_new_style_path_with_unlicensed(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_PREPARE_TOKEN + DEX_UNLICENSED
+        result = analyze(make_manifest("com.target.app"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_unlicensed_in_smali(self):
+        a = PlayIntegrityAnalyzer.__new__(PlayIntegrityAnalyzer)
+        a.verbose = False
+        result = IntegrityAnalysisResult("t.apk", "com.ex", "Ex")
+        a._scan_smali_text(
+            'const-string v0, "UNLICENSED"', "Main.smali", result
+        )
+        self.assertTrue(result.checks_unlicensed)
+        self.assertTrue(result.checks_verdict)
+
+
+# ---------------------------------------------------------------------------
+# Tests: remediation dialog indicators
+# ---------------------------------------------------------------------------
+
+class TestRemediationDialog(unittest.TestCase):
+    """Remediation dialogs redirect users to the Play Store — HIGH risk."""
+
+    def test_get_licensed_sets_remediation_flag(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_LICENSED
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.uses_remediation_dialog)
+
+    def test_close_unknown_source_sets_remediation_flag(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_CLOSE_UNKNOWN_SOURCE
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.uses_remediation_dialog)
+
+    def test_get_licensed_alone_is_high_risk(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_LICENSED
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_close_unknown_source_alone_is_high_risk(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_CLOSE_UNKNOWN_SOURCE
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_request_and_show_dialog_sets_remediation_flag(self):
+        # requestAndShowDialog already sets requests_token; it must ALSO set remediation.
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.uses_remediation_dialog)
+
+    def test_request_and_show_dialog_is_high_risk(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_get_licensed_in_smali(self):
+        a = PlayIntegrityAnalyzer.__new__(PlayIntegrityAnalyzer)
+        a.verbose = False
+        result = IntegrityAnalysisResult("t.apk", "com.ex", "Ex")
+        a._scan_smali_text('const/4 v0, GET_LICENSED', "Main.smali", result)
+        self.assertTrue(result.uses_remediation_dialog)
+
+
+# ---------------------------------------------------------------------------
+# Tests: installer source check indicators
+# ---------------------------------------------------------------------------
+
+class TestInstallerSourceCheck(unittest.TestCase):
+    """Installer source checks verify the app was installed from Play Store.
+    Combined with Play Integrity, this is a direct sideload-blocking pattern."""
+
+    def test_get_installer_package_name_sets_flag(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_INSTALLER_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.checks_installer_source)
+
+    def test_get_install_source_info_sets_flag(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_INSTALL_SOURCE
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.checks_installer_source)
+
+    def test_android_vending_sets_flag(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_PLAY_STORE_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertTrue(result.checks_installer_source)
+
+    def test_installer_check_is_high_risk(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_INSTALLER_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_android_vending_is_high_risk(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_PLAY_STORE_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_installer_check_in_smali(self):
+        a = PlayIntegrityAnalyzer.__new__(PlayIntegrityAnalyzer)
+        a.verbose = False
+        result = IntegrityAnalysisResult("t.apk", "com.ex", "Ex")
+        content = (
+            "invoke-virtual {v0, v1}, Landroid/content/pm/PackageManager;"
+            "->getInstallerPackageName(Ljava/lang/String;)Ljava/lang/String;"
+        )
+        a._scan_smali_text(content, "Main.smali", result)
+        self.assertTrue(result.checks_installer_source)
+
+
+# ---------------------------------------------------------------------------
+# Tests: updated HIGH-risk conditions cover all Digital Turbine blocking paths
+# ---------------------------------------------------------------------------
+
+class TestHighRiskAllPaths(unittest.TestCase):
+    """Every scenario that would block a Digital Turbine install must be HIGH."""
+
+    def test_unrecognized_version_still_high(self):
+        dex = DEX_CLASSIC_FACTORY + DEX_REQUEST_TOKEN + DEX_UNRECOGNIZED_VERSION
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_unlicensed_verdict_high(self):
+        dex = DEX_CLASSIC_FACTORY + DEX_REQUEST_TOKEN + DEX_UNLICENSED
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_get_licensed_dialog_high(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_LICENSED
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_request_and_show_dialog_high(self):
+        dex = DEX_NEW_STANDARD_MANAGER + DEX_REQUEST_SHOW_DIALOG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_installer_package_check_high(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_GET_INSTALLER_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_android_vending_hardcoded_high(self):
+        dex = DEX_CLASSIC_MANAGER + DEX_PLAY_STORE_PKG
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "HIGH")
+
+    def test_verdict_only_still_medium(self):
+        """Checks some verdict field but not a blocking one → MEDIUM, not HIGH."""
+        dex = DEX_CLASSIC_FACTORY + DEX_REQUEST_TOKEN + DEX_VERDICT_FIELD
+        result = analyze(make_manifest("com.ex"), dex=dex)
+        self.assertEqual(result.sideload_risk, "MEDIUM")
+
+    def test_library_only_still_low(self):
+        result = analyze(make_manifest("com.ex"), dex=DEX_CLASSIC_FACTORY)
+        self.assertEqual(result.sideload_risk, "LOW")
+
+
+# ---------------------------------------------------------------------------
+# Tests: SIDELOAD_VERDICTS constant covers both blocking values
+# ---------------------------------------------------------------------------
+
+class TestSideloadVerdictsConstant(unittest.TestCase):
+    def test_unrecognized_version_in_set(self):
+        self.assertIn("UNRECOGNIZED_VERSION", SIDELOAD_VERDICTS)
+
+    def test_unlicensed_in_set(self):
+        self.assertIn("UNLICENSED", SIDELOAD_VERDICTS)
+
+    def test_licensed_not_in_set(self):
+        self.assertNotIn("LICENSED", SIDELOAD_VERDICTS)
+
+    def test_play_recognized_not_in_set(self):
+        self.assertNotIn("PLAY_RECOGNIZED", SIDELOAD_VERDICTS)
 
 
 class TestPreCheckFilter(unittest.TestCase):

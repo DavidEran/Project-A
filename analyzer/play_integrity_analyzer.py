@@ -7,10 +7,16 @@ can use to identify sideloaded installs and block or redirect users to
 the Play Store.
 
 The tool reports a sideload risk level:
-  HIGH   - App checks for UNRECOGNIZED_VERSION (the exact sideload verdict)
-  MEDIUM - App requests tokens and inspects verdict fields
-  LOW    - Integrity library present but no clear enforcement found
-  NONE   - No Play Integrity or SafetyNet detected
+  HIGH   - App actively blocks or redirects non-Play installs.  Any of:
+             • Checks UNRECOGNIZED_VERSION (appRecognitionVerdict for sideloads)
+             • Checks UNLICENSED (appLicensingVerdict for non-Play-licensed installs)
+             • Uses a remediation dialog / Play Store redirect
+               (requestAndShowDialog, GET_LICENSED, CLOSE_UNKNOWN_SOURCE_DIALOG)
+             • Checks installer source (getInstallerPackageName / com.android.vending)
+  MEDIUM - App requests integrity tokens and inspects verdict fields, but no
+           explicit blocking pattern was found — depends on server-side logic.
+  LOW    - Integrity library present but no clear enforcement found.
+  NONE   - No Play Integrity or SafetyNet detected.
 """
 
 import argparse
@@ -62,23 +68,59 @@ REQUEST_METHOD_INDICATORS = [
     "requestIntegrityToken",
     "prepareIntegrityToken",    # Standard API warm-up call
     "requestAndShowDialog",     # Standard API dialog-based flow (library 1.2+)
+                                # NOTE: also sets uses_remediation_dialog — see scanner
 ]
 
 # Verdict-related strings that indicate the app inspects the integrity response.
 # These are the JSON field names / enum values from the Play Integrity verdict.
 VERDICT_INDICATORS = [
+    # Field names
     "appRecognitionVerdict",
-    "PLAY_RECOGNIZED",
-    "UNRECOGNIZED_VERSION",    # Issued for sideloaded / modified installs
-    "UNEVALUATED",
     "deviceRecognitionVerdict",
     "appLicensingVerdict",
-    "NO_LICENSE",
+    # appRecognitionVerdict values
+    "PLAY_RECOGNIZED",
+    "UNRECOGNIZED_VERSION",     # Non-Play install (sideload / Digital Turbine) → HIGH risk
+    "UNEVALUATED",
+    # appLicensingVerdict values
     "LICENSED",
+    "UNLICENSED",               # Non-Play-licensed install (Digital Turbine) → HIGH risk
+    # Legacy / alternative strings kept for coverage
+    "NO_LICENSE",               # Seen in some older integrations
 ]
 
-# The specific verdict value issued when an app is sideloaded
+# Verdict values that definitively identify a non-Play-Store install.
+# Both are returned for apps sideloaded via Digital Turbine or similar:
+#   UNRECOGNIZED_VERSION → appRecognitionVerdict for unknown install sources
+#   UNLICENSED           → appLicensingVerdict for apps not purchased/licensed via Play
+SIDELOAD_VERDICTS = frozenset({"UNRECOGNIZED_VERSION", "UNLICENSED"})
+
+# Kept for backwards compat (single canonical string used in older code paths)
 SIDELOAD_VERDICT = "UNRECOGNIZED_VERSION"
+
+# Play Integrity remediation dialog / Play Store redirect indicators.
+# These constants appear when an app shows a "get this from the Play Store" popup
+# or redirects the user, which blocks non-Play (e.g. Digital Turbine) users.
+#   GET_LICENSED              → IntegrityDialogTypeCode: prompts user to license app via Play
+#   CLOSE_UNKNOWN_SOURCE_DIALOG → IntegrityDialogTypeCode: warns user about sideloading
+# requestAndShowDialog is also a remediation path but lives in REQUEST_METHOD_INDICATORS.
+REMEDIATION_INDICATORS = [
+    "GET_LICENSED",
+    "CLOSE_UNKNOWN_SOURCE_DIALOG",
+]
+
+# Installer source check indicators.
+# Apps that embed these strings are checking whether they were installed from Play Store.
+# When combined with Play Integrity, this is a direct sideload-blocking pattern.
+#   getInstallerPackageName → PackageManager API to retrieve installer package
+#   getInstallSourceInfo    → Newer PackageManager API (API 30+) for install source details
+#   com.android.vending     → Google Play Store package name; if hardcoded, the app is
+#                             comparing the installer against Play Store
+INSTALLER_CHECK_INDICATORS = [
+    "getInstallerPackageName",
+    "getInstallSourceInfo",
+    "com.android.vending",
+]
 
 # Legacy SafetyNet API (deprecated by Google, superseded by Play Integrity)
 SAFETYNET_INDICATORS = [
@@ -102,7 +144,8 @@ class IntegrityUsage:
     """A single detected Play Integrity or SafetyNet API usage site."""
     file: str
     line_number: int
-    # "classic_api" | "standard_api" | "token_request" | "verdict_check" | "safetynet"
+    # "classic_api" | "standard_api" | "token_request" | "verdict_check" |
+    # "safetynet"   | "remediation"  | "installer_check"
     usage_type: str
     matched_string: str
     context_lines: list = field(default_factory=list)
@@ -123,8 +166,11 @@ class IntegrityAnalysisResult:
 
     # Enforcement signals
     requests_token: bool = False         # requestIntegrityToken / prepareIntegrityToken found
-    checks_verdict: bool = False         # Verdict strings found (appRecognitionVerdict etc.)
-    checks_unrecognized: bool = False    # UNRECOGNIZED_VERSION found (strongest sideload signal)
+    checks_verdict: bool = False         # Any verdict string found
+    checks_unrecognized: bool = False    # UNRECOGNIZED_VERSION found (sideload signal)
+    checks_unlicensed: bool = False      # UNLICENSED found (Digital Turbine / non-Play licensing)
+    uses_remediation_dialog: bool = False  # Play Store redirect/dialog detected
+    checks_installer_source: bool = False  # Installer package source check detected
 
     # Manifest indicators
     has_play_core_components: bool = False
@@ -136,19 +182,29 @@ class IntegrityAnalysisResult:
     @property
     def sideload_risk(self) -> str:
         """
-        Estimated risk that sideloading will trigger a block or redirect.
+        Estimated risk that sideloading (including Digital Turbine distribution)
+        will trigger a block or redirect.
 
-        HIGH   - App requests integrity tokens AND explicitly handles
-                 UNRECOGNIZED_VERSION, the verdict issued for sideloaded installs.
-        MEDIUM - App requests integrity tokens AND inspects verdict fields,
-                 but UNRECOGNIZED_VERSION was not found in the binary.
-        LOW    - Play Integrity library present but no clear enforcement found.
+        HIGH   - App actively blocks or redirects non-Play installs via any of:
+                 • Checks UNRECOGNIZED_VERSION or UNLICENSED after requesting a token
+                 • Shows a remediation dialog (requestAndShowDialog, GET_LICENSED, etc.)
+                 • Checks installer package source (getInstallerPackageName, com.android.vending)
+        MEDIUM - App requests integrity tokens and inspects verdict fields, but no
+                 explicit sideload-blocking pattern was found.  Behavior depends on
+                 how the app handles non-Play verdicts server-side.
+        LOW    - Play Integrity library present but no active enforcement detected.
         NONE   - No Play Integrity or SafetyNet detected.
         """
         if not self.uses_play_integrity and not self.uses_safetynet:
             return "NONE"
-        if self.requests_token and self.checks_unrecognized:
+        # HIGH: any pattern that directly blocks or redirects non-Play installs
+        if self.requests_token and (self.checks_unrecognized or self.checks_unlicensed):
             return "HIGH"
+        if self.uses_remediation_dialog:
+            return "HIGH"
+        if self.checks_installer_source:
+            return "HIGH"
+        # MEDIUM: token requested + some verdict inspected, but no explicit blocking string
         if self.requests_token and self.checks_verdict:
             return "MEDIUM"
         return "LOW"
@@ -165,6 +221,9 @@ class IntegrityAnalysisResult:
             "requests_token": self.requests_token,
             "checks_verdict": self.checks_verdict,
             "checks_unrecognized_version": self.checks_unrecognized,
+            "checks_unlicensed": self.checks_unlicensed,
+            "uses_remediation_dialog": self.uses_remediation_dialog,
+            "checks_installer_source": self.checks_installer_source,
             "has_play_core_components": self.has_play_core_components,
             "sideload_risk": self.sideload_risk,
             "files_analyzed": self.files_analyzed,
@@ -362,6 +421,9 @@ class PlayIntegrityAnalyzer:
                         seen_in_file.add(key)
                         result.uses_play_integrity = True
                         result.requests_token = True
+                        # requestAndShowDialog always presents a remediation dialog.
+                        if method == "requestAndShowDialog":
+                            result.uses_remediation_dialog = True
                         result.usages.append(IntegrityUsage(
                             file=filename,
                             line_number=i + 1,
@@ -376,13 +438,43 @@ class PlayIntegrityAnalyzer:
                     if key not in seen_in_file:
                         seen_in_file.add(key)
                         result.checks_verdict = True
-                        if verdict == SIDELOAD_VERDICT:
+                        if verdict == "UNRECOGNIZED_VERSION":
                             result.checks_unrecognized = True
+                        if verdict == "UNLICENSED":
+                            result.checks_unlicensed = True
                         result.usages.append(IntegrityUsage(
                             file=filename,
                             line_number=i + 1,
                             usage_type="verdict_check",
                             matched_string=verdict,
+                            context_lines=ctx,
+                        ))
+
+            for indicator in REMEDIATION_INDICATORS:
+                if indicator in line:
+                    key = ("remediation", indicator)
+                    if key not in seen_in_file:
+                        seen_in_file.add(key)
+                        result.uses_remediation_dialog = True
+                        result.usages.append(IntegrityUsage(
+                            file=filename,
+                            line_number=i + 1,
+                            usage_type="remediation",
+                            matched_string=indicator,
+                            context_lines=ctx,
+                        ))
+
+            for indicator in INSTALLER_CHECK_INDICATORS:
+                if indicator in line:
+                    key = ("installer_check", indicator)
+                    if key not in seen_in_file:
+                        seen_in_file.add(key)
+                        result.checks_installer_source = True
+                        result.usages.append(IntegrityUsage(
+                            file=filename,
+                            line_number=i + 1,
+                            usage_type="installer_check",
+                            matched_string=indicator,
                             context_lines=ctx,
                         ))
 
@@ -446,6 +538,8 @@ class PlayIntegrityAnalyzer:
                 if method in stripped:
                     result.uses_play_integrity = True
                     result.requests_token = True
+                    if method == "requestAndShowDialog":
+                        result.uses_remediation_dialog = True
                     result.usages.append(IntegrityUsage(
                         file=filename, line_number=i + 1,
                         usage_type="token_request", matched_string=method,
@@ -455,11 +549,31 @@ class PlayIntegrityAnalyzer:
             for verdict in VERDICT_INDICATORS:
                 if verdict in stripped:
                     result.checks_verdict = True
-                    if verdict == SIDELOAD_VERDICT:
+                    if verdict == "UNRECOGNIZED_VERSION":
                         result.checks_unrecognized = True
+                    if verdict == "UNLICENSED":
+                        result.checks_unlicensed = True
                     result.usages.append(IntegrityUsage(
                         file=filename, line_number=i + 1,
                         usage_type="verdict_check", matched_string=verdict,
+                        context_lines=ctx,
+                    ))
+
+            for indicator in REMEDIATION_INDICATORS:
+                if indicator in stripped:
+                    result.uses_remediation_dialog = True
+                    result.usages.append(IntegrityUsage(
+                        file=filename, line_number=i + 1,
+                        usage_type="remediation", matched_string=indicator,
+                        context_lines=ctx,
+                    ))
+
+            for indicator in INSTALLER_CHECK_INDICATORS:
+                if indicator in stripped:
+                    result.checks_installer_source = True
+                    result.usages.append(IntegrityUsage(
+                        file=filename, line_number=i + 1,
+                        usage_type="installer_check", matched_string=indicator,
                         context_lines=ctx,
                     ))
 
@@ -506,40 +620,48 @@ def print_report(result: IntegrityAnalysisResult, verbose: bool = False) -> None
     print(SEP)
     print(f"  SIDELOAD RISK: {risk_color}{risk}{RESET}")
     print()
-    print(f"  Play Integrity API present   : {yn(result.uses_play_integrity)}")
+    print(f"  Play Integrity API present      : {yn(result.uses_play_integrity)}")
     if result.uses_play_integrity:
         print(f"    Classic API (IntegrityManager)          : {yn(result.uses_classic_api)}")
         print(f"    Standard API (StandardIntegrityManager) : {yn(result.uses_standard_api)}")
-    print(f"  SafetyNet (legacy) present   : {yn(result.uses_safetynet)}")
+    print(f"  SafetyNet (legacy) present      : {yn(result.uses_safetynet)}")
     print()
-    print(f"  Requests integrity token     : {yn(result.requests_token, RED)}")
-    print(f"  Inspects verdict fields      : {yn(result.checks_verdict, RED)}")
-    print(f"  Checks UNRECOGNIZED_VERSION  : {yn(result.checks_unrecognized, RED)}")
-    print(f"  Play Core manifest components: {yn(result.has_play_core_components)}")
+    print(f"  Requests integrity token        : {yn(result.requests_token, RED)}")
+    print(f"  Inspects verdict fields         : {yn(result.checks_verdict, RED)}")
+    print(f"  Checks UNRECOGNIZED_VERSION     : {yn(result.checks_unrecognized, RED)}")
+    print(f"  Checks UNLICENSED               : {yn(result.checks_unlicensed, RED)}")
+    print(f"  Uses remediation dialog         : {yn(result.uses_remediation_dialog, RED)}")
+    print(f"  Checks installer source         : {yn(result.checks_installer_source, RED)}")
+    print(f"  Play Core manifest components   : {yn(result.has_play_core_components)}")
     print()
 
     explanations = {
         "NONE": (
             "No Play Integrity or SafetyNet detected.\n"
-            "  Sideloaded installs should work without being redirected\n"
-            "  or blocked by the app."
+            "  Sideloaded or third-party distributed installs (e.g. Digital Turbine)\n"
+            "  should work without being redirected or blocked by the app."
         ),
         "HIGH": (
-            "This app explicitly handles UNRECOGNIZED_VERSION,\n"
-            "  the verdict value issued for sideloaded or modified installs.\n"
-            "  Sideloading this app will very likely trigger a block or\n"
-            "  redirect to the Google Play Store."
+            "This app actively blocks or redirects non-Play installs.\n"
+            "  Apps installed via Digital Turbine or other third-party distributors\n"
+            "  will be blocked or redirected to the Google Play Store.\n"
+            "  Detected signals: " + ", ".join(filter(None, [
+                "UNRECOGNIZED_VERSION check" if result.checks_unrecognized else "",
+                "UNLICENSED check" if result.checks_unlicensed else "",
+                "remediation dialog" if result.uses_remediation_dialog else "",
+                "installer source check" if result.checks_installer_source else "",
+            ]))
         ),
         "MEDIUM": (
             "This app requests integrity tokens and inspects verdict fields.\n"
-            "  Sideloaded installs may be blocked depending on how the app\n"
-            "  handles non-Play install verdicts."
+            "  Whether a third-party install is blocked depends on how the app\n"
+            "  handles non-Play verdicts.  Review the app's enforcement logic."
         ),
         "LOW": (
-            "The Play Integrity library is present but no strong enforcement\n"
-            "  pattern was detected. The app may use integrity for purposes\n"
+            "The Play Integrity library is present but no active enforcement\n"
+            "  pattern was detected.  The app may use integrity for purposes\n"
             "  other than sideload detection (e.g. transaction protection).\n"
-            "  Sideloading may or may not be affected."
+            "  Third-party installs are likely unaffected."
         ),
     }
     print(f"  {explanations.get(risk, '')}")
@@ -573,8 +695,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Analyze an Android APK for Google Play Integrity API usage.\n"
-            "Reports whether a sideloaded install is likely to be blocked\n"
-            "or redirected to the Play Store."
+            "Reports whether a sideloaded or third-party distributed install\n"
+            "(e.g. Digital Turbine) is likely to be blocked or redirected."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
