@@ -236,6 +236,9 @@ class PrivacyPolicyResult:
     # Play Store "Privacy Policy" link).  Content-check failures are ignored
     # for these — the label itself is sufficient confirmation.
     trusted_policy_urls: set = field(default_factory=set)
+    # Same for T&C: URLs whose link text explicitly said "Terms & Conditions"
+    # (or equivalent) on the developer's own website.
+    trusted_terms_urls: set = field(default_factory=set)
 
     @property
     def compliance_score(self) -> str:
@@ -457,9 +460,11 @@ def _extract_play_store_support_urls(
         if not _url_matches_privacy(url) and not _url_matches_terms(url)
     ]
     website_url = _nearest(
-        ['"website"', "developer website"],
+        # Play Store renders "Visit website" as the App Support button label;
+        # older/alternate renders may use "Website" or "Developer website".
+        ['"Visit website"', '"website"', "developer website", "visit website"],
         web_candidates,
-        max_dist=800,
+        max_dist=1200,
     )
 
     return pp_url, website_url
@@ -827,6 +832,11 @@ class PrivacyPolicyAnalyzer:
                 self._record_privacy_url(full_url, "Developer website", result)
             elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
                 self._record_terms_url(full_url, "Developer website", result)
+                # If the link text itself said "Terms & Conditions" (or similar),
+                # trust it — the label is the confirmation, same as the Play Store
+                # "Privacy Policy" label.
+                if _text_matches_terms_link(text):
+                    result.trusted_terms_urls.add(full_url)
 
         # Also catch URLs embedded as plain text / in JSON inside the page
         self._scan_text_for_urls("Developer website", html, result, skip_google=True)
@@ -967,19 +977,21 @@ class PrivacyPolicyAnalyzer:
 
         plain = _extract_text_from_html(content)
 
-        if _is_terms_document(plain):
+        trusted = url in result.trusted_terms_urls
+        if _is_terms_document(plain) or trusted:
             result.has_terms_and_conditions = True
             if not result.terms_url:
                 result.terms_url = url
-            result.findings.append(PolicyFinding(
-                source="HTTP fetch",
-                finding_type="terms_url",
-                detail=f"Confirmed T&C document at: {url}",
-                url=url,
-            ))
+            if not trusted:
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="terms_url",
+                    detail=f"Confirmed T&C document at: {url}",
+                    url=url,
+                ))
         else:
             result.errors.append(
-                f"URL matched T&C pattern but content does not look like a "
+                f"Fetched T&C URL but content does not look like a "
                 f"T&C document: {url}"
             )
 
