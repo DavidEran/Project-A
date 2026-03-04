@@ -374,32 +374,39 @@ def _extract_play_store_support_urls(
     Extract (privacy_policy_url, developer_website_url) from a raw Play Store
     HTML page.
 
-    Google Play embeds all app data — including the App Support links — as JSON
-    values inside <script> tags.  We find the relevant URLs by scanning for
-    quoted URL strings that appear within a short window *after* the label that
-    identifies them ("Privacy policy", "Website", etc.).
-
-    This is deliberately narrow: we never accept a URL just because it looks
-    like a privacy/terms URL — it must appear adjacent to the right label in
-    the page data.
+    Google Play embeds App Support data as JSON inside <script> tags.  The
+    ordering is not guaranteed: the URL may appear either *before* or *after*
+    its label in the raw HTML.  We therefore use a nearest-neighbour approach:
+    collect all candidate quoted URLs, find every occurrence of the relevant
+    label keywords, and return whichever URL sits closest (in either direction)
+    to any of those label occurrences.
     """
-    # Matches a JSON-quoted URL: "https://..."
     QUOTED_URL = re.compile(r'"(https?://[^"\s]{8,})"')
 
-    def _first_url_after(
+    # Index all non-Google quoted URLs with their byte positions.
+    candidates: list[tuple[int, str]] = []
+    for m in QUOTED_URL.finditer(html):
+        url = m.group(1)
+        if not _is_google_url(url):
+            candidates.append((m.start(), url))
+
+    def _nearest_url(
         keywords: list,
-        window: int = 600,
+        max_dist: int = 1000,
         require_privacy: bool = False,
         exclude_privacy: bool = False,
         exclude_terms: bool = False,
     ) -> Optional[str]:
-        """Return first non-Google quoted URL within *window* chars of any keyword."""
+        """Return the non-Google quoted URL closest to any keyword occurrence."""
+        best_url: Optional[str] = None
+        best_dist: int = max_dist + 1
+
         for keyword in keywords:
             for km in re.finditer(re.escape(keyword), html, re.IGNORECASE):
-                snippet = html[km.end(): km.end() + window]
-                for um in QUOTED_URL.finditer(snippet):
-                    url = um.group(1)
-                    if _is_google_url(url):
+                kpos = km.start()
+                for upos, url in candidates:
+                    dist = abs(upos - kpos)
+                    if dist >= best_dist:
                         continue
                     if require_privacy and not (
                         _url_matches_privacy(url) or "privacy" in url.lower()
@@ -411,20 +418,21 @@ def _extract_play_store_support_urls(
                         continue
                     if exclude_terms and _url_matches_terms(url):
                         continue
-                    return url
-        return None
+                    best_dist = dist
+                    best_url = url
 
-    pp_url = _first_url_after(
+        return best_url
+
+    pp_url = _nearest_url(
         ["privacy policy", "privacypolicy", "privacy_policy"],
         require_privacy=True,
+        max_dist=1000,
     )
-    # Use the JSON-key form "website" (with quotes) to target the data field,
-    # not every occurrence of the word "website" in the page text.
-    website_url = _first_url_after(
-        ['"website"', "developer website", "app support"],
-        window=400,
+    website_url = _nearest_url(
+        ['"website"', "developer website"],
         exclude_privacy=True,
         exclude_terms=True,
+        max_dist=800,
     )
     return pp_url, website_url
 
