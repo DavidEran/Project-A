@@ -1,7 +1,11 @@
 # Web UI
 streamlit>=1.32.0
 
-# The analyzer uses only Python standard library modules:
+# Browser-based Play Store scraping (Play URL analysis mode)
+# After installing, also run: playwright install chromium
+playwright>=1.40
+
+# The analyzer uses only Python standard library modules for APK analysis:
 #   - zipfile, xml.etree.ElementTree, argparse, re, json, os, sys, pathlib, dataclasses
 
 # For running tests:

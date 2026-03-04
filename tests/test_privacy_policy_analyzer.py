@@ -6,6 +6,7 @@ Unit tests for the Privacy Policy Analyzer.
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from privacy_policy_analyzer import (
     PrivacyPolicyResult,
     PolicyFinding,
     _is_play_store_url,
+    _is_google_url,
     _package_from_play_url,
     _url_matches_privacy,
     _url_matches_terms,
@@ -30,6 +32,7 @@ from privacy_policy_analyzer import (
     _is_terms_document,
     _detect_disclosed_data_categories,
     _extract_links_from_html,
+    _extract_play_store_support_urls,
     _extract_text_from_html,
     _resolve_url,
     print_report,
@@ -623,10 +626,82 @@ class TestPlayUrlAnalysis(unittest.TestCase):
         play_url: str,
         fetch_map: dict[str, str],
     ) -> PrivacyPolicyResult:
+        """
+        Run PrivacyPolicyAnalyzer against a Play Store URL with mocked network.
+
+        _playwright_scrape_play_listing is replaced by a function that simulates
+        what the browser would do — parsing pages from fetch_map — so tests run
+        without a real browser or internet connection.
+
+        _fetch_url is still patched because _process_privacy_url and
+        _process_terms_url use it to fetch and classify policy document content.
+        """
+
         def fake_fetch(url: str, timeout: int = 15) -> str | None:
             return fetch_map.get(url)
 
-        with patch("privacy_policy_analyzer._fetch_url", side_effect=fake_fetch):
+        def fake_playwright_scrape(
+            self_inner: PrivacyPolicyAnalyzer,
+            result: PrivacyPolicyResult,
+        ) -> None:
+            """Simulate browser navigation using fetch_map HTML."""
+            play_page_url = (
+                f"https://play.google.com/store/apps/details"
+                f"?id={result.package_name}&hl=en"
+            )
+            html = fetch_map.get(play_page_url)
+            if html is None:
+                result.errors.append(
+                    f"Could not load Play Store page: {play_page_url}"
+                )
+                return
+
+            # App label from <title>
+            m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
+            if m:
+                result.app_label = re.sub(r"\s*[-–|].*$", "", m.group(1)).strip()
+
+            # PP URL and website URL from rendered App Support section
+            pp_url, website_url = _extract_play_store_support_urls(html)
+
+            if pp_url:
+                self_inner._record_privacy_url(pp_url, "Play Store App Support", result)
+                result.trusted_policy_urls.add(pp_url)
+            else:
+                result.errors.append(
+                    "Could not locate Privacy Policy URL in Play Store App Support section"
+                )
+
+            # Simulate clicking Website → load developer homepage from fetch_map
+            if website_url:
+                dev_html = fetch_map.get(website_url)
+                if dev_html:
+                    links = _extract_links_from_html(dev_html)
+                    for href, text in links:
+                        if not href:
+                            continue
+                        full_url = _resolve_url(href, website_url)
+                        if _is_google_url(full_url):
+                            continue
+                        if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
+                            self_inner._record_privacy_url(full_url, "Developer website", result)
+                        elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
+                            self_inner._record_terms_url(full_url, "Developer website", result)
+                            if _text_matches_terms_link(text):
+                                result.trusted_terms_urls.add(full_url)
+            else:
+                result.errors.append(
+                    "Could not locate developer Website URL in Play Store App Support section"
+                )
+
+        with (
+            patch("privacy_policy_analyzer._fetch_url", side_effect=fake_fetch),
+            patch.object(
+                PrivacyPolicyAnalyzer,
+                "_playwright_scrape_play_listing",
+                fake_playwright_scrape,
+            ),
+        ):
             return PrivacyPolicyAnalyzer(play_url).analyze()
 
     PLAY_URL = "https://play.google.com/store/apps/details?id=com.example.app"
@@ -646,7 +721,7 @@ class TestPlayUrlAnalysis(unittest.TestCase):
 
     def test_play_page_fetch_failure(self):
         result = self._analyze_play(self.PLAY_URL, {})
-        self.assertTrue(any("Could not fetch Play Store" in e for e in result.errors))
+        self.assertTrue(any("Could not load Play Store page" in e for e in result.errors))
 
     def test_privacy_link_found_on_play_page(self):
         result = self._analyze_play(

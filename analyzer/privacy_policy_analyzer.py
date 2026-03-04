@@ -757,93 +757,144 @@ class PrivacyPolicyAnalyzer:
             self._finalize(result)
             return result
 
-        self._fetch_play_listing(result)
+        self._playwright_scrape_play_listing(result)
         self._fetch_and_classify_urls(result)
         self._finalize(result)
         return result
 
-    def _fetch_play_listing(self, result: PrivacyPolicyResult) -> None:
-        """Fetch the Google Play Store listing page and extract policy links."""
+    def _playwright_scrape_play_listing(self, result: PrivacyPolicyResult) -> None:
+        """
+        Use a headless browser (Playwright) to render the Play Store listing,
+        extract the Privacy Policy URL from the App Support section, click the
+        "Website" link to open the developer's homepage in a new tab, then scan
+        that page's rendered DOM for privacy policy and T&C links.
+
+        This replaces the old urllib-based _fetch_play_listing approach: a real
+        browser handles JavaScript rendering, Google's redirect chains, and the
+        target="_blank" new-tab behaviour of the Website button.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            result.errors.append(
+                "playwright is not installed. "
+                "Run: pip install playwright && playwright install chromium"
+            )
+            return
+
         play_url = (
             f"https://play.google.com/store/apps/details"
             f"?id={urllib.parse.quote(result.package_name)}&hl=en"
         )
-        if self.verbose:
-            print(f"  Fetching Play Store page: {play_url}")
 
-        html = _fetch_url(play_url)
-        if html is None:
-            result.errors.append(f"Could not fetch Play Store page: {play_url}")
-            return
-
-        # Extract app label from page title
-        m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
-        if m:
-            title = m.group(1)
-            # Title is typically "App Name - Apps on Google Play"
-            app_name = re.sub(r"\s*[-–|].*$", "", title).strip()
-            result.app_label = app_name
-
-        # Extract the Privacy Policy URL and developer Website URL directly from
-        # the App Support section data embedded in the Play Store page.
-        # This is the only trusted source — broad scanning of the page HTML picks
-        # up SDK EULAs, Google's own policies, and other irrelevant URLs.
-        pp_url, website_url = _extract_play_store_support_urls(html)
-
-        if pp_url:
-            if self.verbose:
-                print(f"  App Support PP URL: {pp_url}")
-            self._record_privacy_url(pp_url, "Play Store App Support", result)
-            # This URL carries an explicit "Privacy Policy" label from Google
-            # Play — content-check failure must not override that confirmation.
-            result.trusted_policy_urls.add(pp_url)
-        else:
-            result.errors.append(
-                "Could not locate Privacy Policy URL in Play Store App Support section"
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                locale="en-US",
+                viewport={"width": 1280, "height": 900},
             )
+            page = context.new_page()
 
-        if website_url:
-            if self.verbose:
-                print(f"  App Support website: {website_url}")
-            self._fetch_developer_website(website_url, result)
-        else:
-            result.errors.append(
-                "Could not locate developer Website URL in Play Store App Support section"
-            )
+            # --- Load Play Store listing ---
+            try:
+                if self.verbose:
+                    print(f"  [browser] Loading Play Store page: {play_url}")
+                page.goto(play_url, wait_until="networkidle", timeout=30_000)
+            except Exception as exc:
+                result.errors.append(f"Could not load Play Store page: {exc}")
+                browser.close()
+                return
 
-    def _fetch_developer_website(
-        self, dev_url: str, result: PrivacyPolicyResult
-    ) -> None:
-        """
-        Fetch the developer's homepage and extract privacy policy / T&C links.
-        All Google-owned URLs are ignored.
-        """
-        if self.verbose:
-            print(f"  Fetching developer website: {dev_url}")
-        html = _fetch_url(dev_url)
-        if html is None:
-            result.errors.append(f"Could not fetch developer website: {dev_url}")
-            return
+            # App label from page title ("App Name - Apps on Google Play")
+            result.app_label = re.sub(r"\s*[-–|].*$", "", page.title()).strip()
 
-        links = _extract_links_from_html(html)
-        for href, text in links:
-            if not href:
-                continue
-            full_url = _resolve_url(href, dev_url)
-            if _is_google_url(full_url):
-                continue
-            if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
-                self._record_privacy_url(full_url, "Developer website", result)
-            elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
-                self._record_terms_url(full_url, "Developer website", result)
-                # If the link text itself said "Terms & Conditions" (or similar),
-                # trust it — the label is the confirmation, same as the Play Store
-                # "Privacy Policy" label.
-                if _text_matches_terms_link(text):
-                    result.trusted_terms_urls.add(full_url)
+            # --- Privacy Policy link (App Support section) ---
+            # get_by_role("link") matches <a> elements by their accessible name,
+            # which is the visible label text even when icons have aria-hidden.
+            pp_href: Optional[str] = None
+            for selector in [
+                lambda: page.get_by_role("link", name=re.compile(r"privacy policy", re.IGNORECASE)).first,
+                lambda: page.locator("a:has-text('Privacy policy'), a:has-text('Privacy Policy')").first,
+            ]:
+                try:
+                    pp_href = selector().get_attribute("href", timeout=5_000)
+                    if pp_href:
+                        break
+                except Exception:
+                    continue
 
-        # Also catch URLs embedded as plain text / in JSON inside the page
-        self._scan_text_for_urls("Developer website", html, result, skip_google=True)
+            if pp_href and not _is_google_url(pp_href):
+                if self.verbose:
+                    print(f"  [browser] App Support PP URL: {pp_href}")
+                self._record_privacy_url(pp_href, "Play Store App Support", result)
+                # Explicitly labelled by Google Play — trust it even if content
+                # checks are inconclusive.
+                result.trusted_policy_urls.add(pp_href)
+            else:
+                result.errors.append(
+                    "Could not locate Privacy Policy URL in Play Store App Support section"
+                )
+
+            # --- Website button: click it, capture the new tab ---
+            try:
+                website_link = None
+                for selector in [
+                    lambda: page.get_by_role("link", name=re.compile(r"^website$", re.IGNORECASE)).first,
+                    lambda: page.locator("a:has-text('Website')").first,
+                ]:
+                    try:
+                        candidate = selector()
+                        candidate.wait_for(state="visible", timeout=5_000)
+                        website_link = candidate
+                        break
+                    except Exception:
+                        continue
+
+                if website_link is None:
+                    raise RuntimeError("Website link not found on page")
+
+                if self.verbose:
+                    print("  [browser] Clicking Website link …")
+
+                with context.expect_page(timeout=10_000) as popup_info:
+                    website_link.click(timeout=5_000)
+
+                dev_page = popup_info.value
+                dev_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                dev_url = dev_page.url
+
+                if self.verbose:
+                    print(f"  [browser] Developer website: {dev_url}")
+
+                # Scan all rendered links on the developer homepage
+                for link in dev_page.get_by_role("link").all():
+                    try:
+                        href = link.get_attribute("href")
+                        text = link.inner_text().strip()
+                    except Exception:
+                        continue
+                    if not href:
+                        continue
+                    full_url = _resolve_url(href, dev_url)
+                    if _is_google_url(full_url):
+                        continue
+                    if _text_matches_privacy_link(text) or _url_matches_privacy(full_url):
+                        self._record_privacy_url(full_url, "Developer website", result)
+                    elif _text_matches_terms_link(text) or _url_matches_terms(full_url):
+                        self._record_terms_url(full_url, "Developer website", result)
+                        if _text_matches_terms_link(text):
+                            result.trusted_terms_urls.add(full_url)
+
+                dev_page.close()
+
+            except Exception as exc:
+                result.errors.append(
+                    "Could not locate developer Website URL in Play Store App Support section"
+                )
+                if self.verbose:
+                    print(f"  [browser] Website navigation failed: {exc}")
+
+            browser.close()
 
     # ------------------------------------------------------------------
     # URL scanning helpers
