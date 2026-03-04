@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Privacy Policy Analyzer — Streamlit Web UI
+Privacy Policy Analyzer — Streamlit Web UI  (v2)
 
 Run locally:
     streamlit run web_ui.py
