@@ -59,6 +59,11 @@ PERSONAL_DATA_CATEGORIES: dict[str, list[str]] = {
         "device id", "device identifier", "imei", "imsi", "mac address",
         "ip address", "advertising id", "android id", "hardware identifier",
         "unique identifier", "device information",
+        # Explicit advertising / platform identifier phrases
+        "unique device identifier", "identifier for advertising",
+        "advertising identifier", "google advertiser id",
+        "apple id for advertising", "idfa", "gaid",
+        "google advertising id",
     ],
     "financial": [
         "payment information", "credit card", "debit card", "billing information",
@@ -152,7 +157,27 @@ TERMS_LINK_TEXT = [
 
 # Minimum number of personal data categories that must be disclosed for
 # the privacy policy to be considered informative.
-MIN_DATA_CATEGORIES = 2
+MIN_DATA_CATEGORIES = 1
+
+# Phrases that indicate the developer explicitly declares they collect no
+# personal data.  When matched, check 3 is treated as passed (the
+# disclosure IS "we collect nothing").
+NO_DATA_COLLECTION_PHRASES = [
+    "we do not collect",
+    "we don't collect",
+    "we do not store",
+    "we don't store",
+    "no personal information is collected",
+    "no personal data is collected",
+    "no personal information collected",
+    "no personally identifiable information",
+    "does not collect any personal",
+    "do not collect any personal",
+    "not collect or store",
+    "we collect no personal",
+    "no data is collected",
+    "no information is collected",
+]
 
 # HTTP request timeout in seconds
 HTTP_TIMEOUT = 15
@@ -198,6 +223,9 @@ class PrivacyPolicyResult:
     # Check 3: Personal data disclosure
     discloses_collected_data: bool = False
     disclosed_data_categories: list = field(default_factory=list)  # category names found
+    # True when the policy explicitly declares that no personal data is
+    # collected (rather than simply not mentioning any categories).
+    declares_no_data_collection: bool = False
 
     # Supporting data
     all_policy_urls_found: list = field(default_factory=list)   # all candidate privacy URLs
@@ -238,6 +266,7 @@ class PrivacyPolicyResult:
                 "terms_url": self.terms_url,
                 "discloses_collected_data": self.discloses_collected_data,
                 "disclosed_data_categories": self.disclosed_data_categories,
+                "declares_no_data_collection": self.declares_no_data_collection,
             },
             "all_privacy_urls_found": self.all_policy_urls_found,
             "all_terms_urls_found": self.all_terms_urls_found,
@@ -491,6 +520,16 @@ def _detect_disclosed_data_categories(text: str) -> list[str]:
         if any(kw in low for kw in keywords):
             found.append(category)
     return found
+
+
+def _declares_no_personal_data_collected(text: str) -> bool:
+    """
+    Return True if the text contains an explicit declaration that no
+    personal data is collected (e.g. "We do not collect any personal
+    information").
+    """
+    low = text.lower()
+    return any(phrase in low for phrase in NO_DATA_COLLECTION_PHRASES)
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +930,15 @@ class PrivacyPolicyAnalyzer:
             categories = _detect_disclosed_data_categories(plain)
             self._record_data_categories(categories, url, result)
 
+            if not categories and _declares_no_personal_data_collected(plain):
+                result.declares_no_data_collection = True
+                result.findings.append(PolicyFinding(
+                    source="HTTP fetch",
+                    finding_type="data_category",
+                    detail="Policy explicitly declares no personal data is collected",
+                    url=url,
+                ))
+
             # Fallback: the privacy policy page sometimes links to the T&C.
             # Scan it for T&C links (skip Google URLs).
             if not result.all_terms_urls_found:
@@ -965,9 +1013,12 @@ class PrivacyPolicyAnalyzer:
                 result.has_terms_and_conditions = True
                 result.terms_url = result.all_terms_urls_found[0]
 
-        # Determine data disclosure sufficiency
+        # Determine data disclosure sufficiency.
+        # A developer who explicitly declares "we collect nothing" also passes —
+        # that declaration IS the required disclosure.
         result.discloses_collected_data = (
             len(result.disclosed_data_categories) >= MIN_DATA_CATEGORIES
+            or result.declares_no_data_collection
         )
 
 
@@ -1033,6 +1084,8 @@ def print_report(result: PrivacyPolicyResult, verbose: bool = False) -> None:
         print(f"      Data categories disclosed ({len(result.disclosed_data_categories)}):")
         for cat in result.disclosed_data_categories:
             print(f"        - {cat}")
+    elif result.declares_no_data_collection:
+        print(f"      {GREEN}App developer declared no personal data is collected.{RESET}")
     elif result.has_privacy_policy:
         print(f"      {YELLOW}Warning: No personal data categories detected in the policy.{RESET}")
 
