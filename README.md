@@ -308,6 +308,24 @@ python3 analyzer/privacy_policy_analyzer.py app.apk --json --output result.json
 | `1`  | `PARTIAL` or `NON_COMPLIANT` |
 | `2`  | Input error (file not found, not a valid APK, etc.) |
 
+### Web UI
+
+A self-contained browser interface — no additional dependencies required.
+
+```bash
+python3 web_ui.py                   # http://localhost:5000
+python3 web_ui.py --port 8080       # custom port
+python3 web_ui.py --host 0.0.0.0    # accessible on the local network
+```
+
+Open the URL in your browser. You can either:
+- **Upload an APK** — drag-and-drop or click to browse for a `.apk` file
+- **Enter a Play Store URL** — paste a `play.google.com/store/apps/details?id=…` link
+
+Results are displayed with a color-coded compliance badge, per-check pass/fail
+indicators, a list of detected personal data categories, and a collapsible
+findings/errors section.
+
 ### Running the tests
 
 ```bash
