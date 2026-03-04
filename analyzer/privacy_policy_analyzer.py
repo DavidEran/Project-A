@@ -788,7 +788,23 @@ class PrivacyPolicyAnalyzer:
         )
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as exc:
+                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                    # Browser binaries not yet downloaded (e.g. first run on a fresh
+                    # deployment). Install them automatically and retry once.
+                    import subprocess
+                    if self.verbose:
+                        print("  [browser] Chromium not found — running 'playwright install chromium' …")
+                    subprocess.run(
+                        [sys.executable, "-m", "playwright", "install", "chromium"],
+                        check=True,
+                    )
+                    browser = p.chromium.launch(headless=True)
+                else:
+                    result.errors.append(f"Could not launch browser: {exc}")
+                    return
             context = browser.new_context(
                 locale="en-US",
                 viewport={"width": 1280, "height": 900},
