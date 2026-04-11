@@ -1,6 +1,12 @@
 # Web UI
 streamlit>=1.32.0
 
+# Stock Valuation Calculator
+yfinance>=0.2.40
+pandas>=2.0.0
+plotly>=5.20.0
+google-genai>=1.0.0          # optional — Gemini-powered field hints
+
 # The analyzer uses only Python standard library modules:
 #   - zipfile, xml.etree.ElementTree, argparse, re, json, os, sys, pathlib, dataclasses
 
