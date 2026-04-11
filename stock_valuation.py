@@ -185,9 +185,26 @@ Be specific, cite the data above where relevant.
 Respond ONLY with valid JSON (no markdown):
 {{"growth_rate":"...", "margin":"...", "pe_low":"...", "pe_base":"...", "pe_high":"..."}}"""
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash", contents=prompt
-    )
+    # Try models in preference order; fall back if one is unavailable
+    models_to_try = [
+        "gemini-2.5-flash-preview-04-17",
+        "gemini-2.5-pro-preview-03-25",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
+    response = None
+    last_exc = None
+    for model_id in models_to_try:
+        try:
+            response = client.models.generate_content(model=model_id, contents=prompt)
+            break
+        except Exception as exc:
+            if "404" in str(exc) or "NOT_FOUND" in str(exc) or "no longer available" in str(exc).lower():
+                last_exc = exc
+                continue
+            raise
+    if response is None:
+        raise last_exc
     text = response.text.strip()
     # Strip possible markdown fences
     if "```" in text:
