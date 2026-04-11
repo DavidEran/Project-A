@@ -30,15 +30,25 @@ FMP_STABLE = "https://financialmodelingprep.com/stable"
 FMP_V3     = "https://financialmodelingprep.com/api/v3"
 
 
-def get_secret(key: str) -> str:
-    """Load from st.secrets → env var → empty string."""
+def _load_toml_secrets() -> dict:
+    """Read .streamlit/secrets.toml directly — no st.secrets dependency."""
+    path = Path(__file__).parent / ".streamlit" / "secrets.toml"
+    if not path.exists():
+        return {}
     try:
-        val = st.secrets.get(key)
-        if val:
-            return str(val)
-    except (AttributeError, KeyError, FileNotFoundError):
-        pass
-    return os.environ.get(key, "")
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        logger.warning("Could not load secrets.toml: %s", e)
+        return {}
+
+_SECRETS = _load_toml_secrets()
+
+
+def get_secret(key: str) -> str:
+    """Load from secrets.toml → env var → empty string."""
+    return str(_SECRETS.get(key) or os.environ.get(key, ""))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config + CSS
@@ -201,15 +211,29 @@ def fetch_stock_data(ticker: str, api_key: str) -> dict:
 
     sf = lambda v, d=None: float(v) if v not in (None, "", "N/A") else d
 
+    price  = sf(p.get("price"))
+    mkt_cap = sf(p.get("mktCap"), 0) / 1e9
+
+    # Try every field name FMP has used across API versions
+    shares_raw = (p.get("sharesOutstanding")
+               or p.get("outstandingShares")
+               or p.get("commonStockSharesOutstanding")
+               or 0)
+    shares_b = sf(shares_raw, 0) / 1e9
+
+    # Fallback: derive from market cap and price if still zero
+    if shares_b == 0 and mkt_cap > 0 and price and price > 0:
+        shares_b = mkt_cap / price  # $B / $ = B shares
+
     return {
         "name":               p.get("companyName", ticker),
         "ticker":             ticker,
         "logo":               p.get("image", ""),
         "sector":             p.get("sector", ""),
         "industry":           p.get("industry", ""),
-        "current_price":      sf(p.get("price")),
-        "shares_outstanding": sf(p.get("sharesOutstanding"), 0) / 1e9,
-        "market_cap":         sf(p.get("mktCap"), 0) / 1e9,
+        "current_price":      price,
+        "shares_outstanding": shares_b,
+        "market_cap":         mkt_cap,
         "ttm_revenue":        sf(revenues[0] if revenues else None, 0) / 1e9,
         "pe_ratio":           sf(p.get("pe")),
         "revenue_cagr":       revenue_cagr,
@@ -271,16 +295,16 @@ Return ONLY valid JSON (no markdown, no explanation):
             try:
                 return json.loads(text)
             except json.JSONDecodeError as je:
-                raise ValueError(f"Gemini returned invalid JSON: {je}") from je
-        except ValueError:
-            raise
+                # Bad JSON from this model — try the next one
+                last_exc = ValueError(f"Gemini returned invalid JSON: {je}")
+                continue
         except Exception as e:
             err = str(e)
             if any(k in err for k in ("404", "NOT_FOUND", "no longer available", "unavailable")):
                 last_exc = e
                 continue
-            raise  # non-availability errors bubble up immediately
-    raise last_exc
+            raise  # unexpected errors bubble up immediately
+    raise last_exc or RuntimeError("All Gemini models exhausted")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
