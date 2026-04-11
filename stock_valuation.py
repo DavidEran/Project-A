@@ -4,11 +4,15 @@ Stock Valuation Calculator — FMP + Gemini
 Run: streamlit run stock_valuation.py
 """
 
+import html as html_mod
 import json
+import logging
 import os
 import time
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -32,7 +36,7 @@ def get_secret(key: str) -> str:
         val = st.secrets.get(key)
         if val:
             return str(val)
-    except Exception:
+    except (AttributeError, KeyError, FileNotFoundError):
         pass
     return os.environ.get(key, "")
 
@@ -156,15 +160,15 @@ def fetch_stock_data(ticker: str, api_key: str) -> dict:
         try:
             analyst  = _fmp_request(f"{FMP_STABLE}/analyst-estimates",
                                     api_key, {"symbol": ticker, "period": "annual", "limit": 5})
-        except Exception:
+        except (requests.exceptions.RequestException, ValueError):
             analyst = []
-    except Exception:
+    except (requests.exceptions.RequestException, ValueError):
         # Fall back to legacy v3 (ticker in path)
         profile_list = _fmp_request(f"{FMP_V3}/profile/{ticker}",      api_key, {})
         income       = _fmp_request(f"{FMP_V3}/income-statement/{ticker}", api_key, {"limit": 4})
         try:
             analyst  = _fmp_request(f"{FMP_V3}/analyst-estimates/{ticker}", api_key, {"limit": 5})
-        except Exception:
+        except (requests.exceptions.RequestException, ValueError):
             analyst = []
 
     if not profile_list:
@@ -264,12 +268,18 @@ Return ONLY valid JSON (no markdown, no explanation):
                 text = text.split("```")[1]
                 if text.startswith("json"): text = text[4:]
                 text = text.split("```")[0].strip()
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as je:
+                raise ValueError(f"Gemini returned invalid JSON: {je}") from je
+        except ValueError:
+            raise
         except Exception as e:
-            if any(k in str(e) for k in ("404", "NOT_FOUND", "no longer available")):
+            err = str(e)
+            if any(k in err for k in ("404", "NOT_FOUND", "no longer available", "unavailable")):
                 last_exc = e
                 continue
-            raise
+            raise  # non-availability errors bubble up immediately
     raise last_exc
 
 
@@ -301,8 +311,11 @@ def build_scenarios(profit, pe_low, pe_base, pe_high, shares, price, n):
 # ─────────────────────────────────────────────────────────────────────────────
 def load_analyses():
     if SAVE_FILE.exists():
-        try: return json.loads(SAVE_FILE.read_text())
-        except: return {}
+        try:
+            return json.loads(SAVE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not load saved analyses: %s", e)
+            return {}
     return {}
 
 def save_analysis(ticker, inputs, forecast, scenarios):
@@ -314,7 +327,8 @@ def save_analysis(ticker, inputs, forecast, scenarios):
 
 def hint(text):
     if text:
-        st.markdown(f'<div class="hint-box">💡 {text}</div>', unsafe_allow_html=True)
+        safe = html_mod.escape(str(text))
+        st.markdown(f'<div class="hint-box">💡 {safe}</div>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,8 +382,15 @@ if fetch_clicked and ticker_input.strip():
                 st.session_state["stock"]   = fetch_stock_data(ticker_input, fmp_key)
                 st.session_state["hints"]   = {}
                 st.session_state["prefill"] = {}
-            except Exception as e:
-                st.error(str(e))
+            except ValueError as e:
+                st.error(f"Could not fetch {ticker_input.upper()}: {html_mod.escape(str(e))}")
+            except requests.exceptions.HTTPError as e:
+                code = e.response.status_code if e.response is not None else "?"
+                st.error(f"FMP API returned HTTP {code}. Check your API key or try again later.")
+                logger.error("FMP HTTP error: %s", e)
+            except requests.exceptions.RequestException as e:
+                st.error("Network error reaching FMP. Check your connection and try again.")
+                logger.error("FMP request error: %s", e)
 
         if gemini_key and GEMINI_AVAILABLE and "stock" in st.session_state:
             with st.spinner("Getting Gemini hints…"):
@@ -377,7 +398,8 @@ if fetch_clicked and ticker_input.strip():
                     st.session_state["hints"] = get_gemini_hints(
                         st.session_state["stock"], gemini_key)
                 except Exception as e:
-                    st.warning(f"Gemini hints unavailable: {e}")
+                    st.warning("Gemini hints unavailable. You can still use the tool manually.")
+                    logger.warning("Gemini hints error: %s", e)
 
 # ── Load saved ───────────────────────────────────────────────────────────────
 if "load_req" in st.session_state:
@@ -403,15 +425,24 @@ s      = st.session_state["stock"]
 hints  = st.session_state.get("hints", {})
 prefill= st.session_state.get("prefill", {})
 
-logo_html = (f'<img src="{s["logo"]}" onerror="this.style.display=\'none\'">'
-             if s.get("logo") else "")
-sector_badge = (f'<span class="sector-badge">{s["sector"]}</span>' if s.get("sector") else "")
+def _safe_img_url(url: str) -> str:
+    """Allow only http/https image URLs from FMP's CDN."""
+    url = str(url or "").strip()
+    return url if url.startswith(("https://", "http://")) else ""
+
+_e = html_mod.escape  # shorthand for escaping API-sourced strings
+
+logo_url  = _safe_img_url(s.get("logo", ""))
+logo_html = (f'<img src="{logo_url}" onerror="this.style.display=\'none\'">'
+             if logo_url else "")
+sector_badge = (f'<span class="sector-badge">{_e(s["sector"])}</span>'
+                if s.get("sector") else "")
 st.markdown(f"""
 <div class="stock-header">
   {logo_html}
   <div>
-    <h2>{s['name']} <span style="color:#8b949e;font-size:1rem">({s['ticker']})</span>{sector_badge}</h2>
-    <span>{s.get('industry','')}</span>
+    <h2>{_e(s['name'])} <span style="color:#8b949e;font-size:1rem">({_e(s['ticker'])})</span>{sector_badge}</h2>
+    <span>{_e(s.get('industry',''))}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
