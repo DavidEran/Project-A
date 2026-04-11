@@ -5,3 +5,4 @@ __pycache__/
 
 # Temporary APK files from check_play_integrity.sh
 /tmp/play_integrity_check_*.apk
+.streamlit/secrets.toml

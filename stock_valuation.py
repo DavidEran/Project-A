@@ -21,8 +21,20 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
-SAVE_FILE = Path(__file__).parent / "saved_analyses.json"
-FMP_BASE  = "https://financialmodelingprep.com/api"
+SAVE_FILE  = Path(__file__).parent / "saved_analyses.json"
+FMP_STABLE = "https://financialmodelingprep.com/stable"
+FMP_V3     = "https://financialmodelingprep.com/api/v3"
+
+
+def get_secret(key: str) -> str:
+    """Load from st.secrets → env var → empty string."""
+    try:
+        val = st.secrets.get(key)
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return os.environ.get(key, "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config + CSS
@@ -119,32 +131,45 @@ section.main > div                 { padding-top: 1.5rem; }
 # ─────────────────────────────────────────────────────────────────────────────
 # FMP helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def fmp(endpoint: str, key: str, params: dict = None) -> any:
-    p = params or {}
+def _fmp_request(url: str, key: str, params: dict) -> any:
+    p = dict(params)
     p["apikey"] = key
-    r = requests.get(f"{FMP_BASE}/{endpoint}", params=p, timeout=12)
+    r = requests.get(url, params=p, timeout=12)
     r.raise_for_status()
     data = r.json()
-    if isinstance(data, dict) and "Error Message" in data:
-        raise ValueError(data["Error Message"])
+    if isinstance(data, dict) and ("Error Message" in data or "message" in data):
+        msg = data.get("Error Message") or data.get("message", "Unknown FMP error")
+        raise ValueError(msg)
     return data
 
 
 def fetch_stock_data(ticker: str, api_key: str) -> dict:
     ticker = ticker.upper().strip()
 
-    profile_list = fmp(f"v3/profile/{ticker}", api_key)
+    # Try stable API first (new FMP format), fall back to v3
+    profile_list = income = analyst = None
+    try:
+        profile_list = _fmp_request(f"{FMP_STABLE}/profile",
+                                    api_key, {"symbol": ticker})
+        income       = _fmp_request(f"{FMP_STABLE}/income-statement",
+                                    api_key, {"symbol": ticker, "period": "annual", "limit": 4})
+        try:
+            analyst  = _fmp_request(f"{FMP_STABLE}/analyst-estimates",
+                                    api_key, {"symbol": ticker, "period": "annual", "limit": 5})
+        except Exception:
+            analyst = []
+    except Exception:
+        # Fall back to legacy v3 (ticker in path)
+        profile_list = _fmp_request(f"{FMP_V3}/profile/{ticker}",      api_key, {})
+        income       = _fmp_request(f"{FMP_V3}/income-statement/{ticker}", api_key, {"limit": 4})
+        try:
+            analyst  = _fmp_request(f"{FMP_V3}/analyst-estimates/{ticker}", api_key, {"limit": 5})
+        except Exception:
+            analyst = []
+
     if not profile_list:
         raise ValueError(f"Ticker {ticker} not found.")
     p = profile_list[0]
-
-    income = fmp("v3/income-statement/" + ticker, api_key, {"limit": 4})
-
-    analyst = []
-    try:
-        analyst = fmp("v3/analyst-estimates/" + ticker, api_key, {"limit": 5})
-    except Exception:
-        pass
 
     # Revenue CAGR from income statements
     revenue_cagr = None
@@ -202,17 +227,32 @@ GEMINI_MODELS = [
 
 def get_gemini_hints(s: dict, api_key: str) -> dict:
     client = google_genai.Client(api_key=api_key)
-    prompt = f"""You are a concise financial analyst. Given this data for {s['name']} ({s['ticker']}):
-Sector: {s.get('sector')} | Industry: {s.get('industry')}
-TTM Revenue: ${s.get('ttm_revenue',0):.1f}B
-3-yr Revenue CAGR: {f"{s['revenue_cagr']*100:.1f}%" if s.get('revenue_cagr') else 'N/A'}
-Analyst Revenue CAGR: {f"{s['analyst_rev_growth']*100:.1f}%" if s.get('analyst_rev_growth') else 'N/A'}
-TTM Net Margin: {f"{s['current_margin']*100:.1f}%" if s.get('current_margin') else 'N/A'}
-3yr Avg Margin: {f"{s['avg_margin']*100:.1f}%" if s.get('avg_margin') else 'N/A'}
-Trailing P/E: {s.get('pe_ratio') or 'N/A'}
 
-Write a SHORT hint (max 15 words) for each field. Cite the data. Be specific.
-Respond ONLY with valid JSON:
+    cagr = f"{s['revenue_cagr']*100:.1f}%"       if s.get('revenue_cagr')       else 'N/A'
+    ag   = f"{s['analyst_rev_growth']*100:.1f}%"  if s.get('analyst_rev_growth') else 'N/A'
+    cm   = f"{s['current_margin']*100:.1f}%"      if s.get('current_margin')     else 'N/A'
+    am   = f"{s['avg_margin']*100:.1f}%"          if s.get('avg_margin')         else 'N/A'
+    pe   = str(s.get('pe_ratio') or 'N/A')
+
+    prompt = f"""You are a sell-side equity research analyst writing decision-oriented hints for a stock valuation tool.
+
+COMPANY: {s['name']} ({s['ticker']}) | SECTOR: {s.get('sector')} | INDUSTRY: {s.get('industry')}
+
+DATA:
+- TTM Revenue: ${s.get('ttm_revenue', 0):.1f}B
+- 3yr Historical Revenue CAGR: {cagr}
+- Analyst Consensus Revenue CAGR: {ag}
+- TTM Net Margin: {cm}
+- 3yr Average Net Margin: {am}
+- Trailing P/E: {pe}
+
+RESEARCH STANDARDS:
+1. Every claim must cite the data above (e.g. "3yr CAGR: 12%")
+2. Include a contrarian or downside note where relevant
+3. Be decision-oriented — help the user pick a number
+4. Max 20 words per hint
+
+Return ONLY valid JSON (no markdown, no explanation):
 {{"growth_rate":"...","margin":"...","pe_low":"...","pe_base":"...","pe_high":"..."}}"""
 
     last_exc = None
@@ -282,10 +322,10 @@ def hint(text):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ API Keys")
-    fmp_key    = st.text_input("FMP API Key",    value=os.environ.get("FMP_API_KEY", ""),
-                               type="password")
+    fmp_key    = st.text_input("FMP API Key",
+                               value=get_secret("FMP_API_KEY"), type="password")
     gemini_key = st.text_input("Gemini API Key (optional)",
-                               value=os.environ.get("GEMINI_API_KEY", ""), type="password")
+                               value=get_secret("GEMINI_API_KEY"), type="password")
     if not GEMINI_AVAILABLE:
         st.caption("Install `google-genai` for AI hints.")
 
