@@ -8,6 +8,7 @@ Run:
 """
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -65,9 +66,29 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_stock_data(ticker: str) -> dict:
+def fetch_stock_data(ticker: str, max_retries: int = 4) -> dict:
+    last_exc = None
+    for attempt in range(max_retries):
+        if attempt > 0:
+            wait = 2 ** attempt  # 2s, 4s, 8s
+            time.sleep(wait)
+        try:
+            return _fetch_stock_data_once(ticker)
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            # Only retry on rate-limit / network errors
+            if not any(k in msg for k in ("429", "rate", "too many", "timeout", "connection")):
+                raise
+    raise last_exc
+
+
+def _fetch_stock_data_once(ticker: str) -> dict:
     t = yf.Ticker(ticker)
     info = t.info or {}
+    if not info or info.get("trailingPE") is None and info.get("currentPrice") is None and info.get("regularMarketPrice") is None:
+        # yfinance sometimes returns an empty dict on rate limit without raising
+        raise Exception("Too Many Requests. Rate limited. Try after a while.")
 
     # ── Historical revenue CAGR ──
     revenue_cagr = None
@@ -277,13 +298,20 @@ with bc:
 
 # ── Handle fetch ──────────────────────────────────────────────────────────────
 if fetch_clicked and ticker_input.strip():
-    with st.spinner(f"Fetching {ticker_input.upper()}…"):
+    with st.spinner(f"Fetching {ticker_input.upper()}… (retries up to 3x on rate limit)"):
         try:
             st.session_state["stock"] = fetch_stock_data(ticker_input.strip())
             st.session_state["hints"] = {}
             st.session_state["prefill"] = {}
         except Exception as exc:
-            st.error(f"Could not fetch {ticker_input.upper()}: {exc}")
+            msg = str(exc)
+            if any(k in msg.lower() for k in ("429", "rate", "too many")):
+                st.error(
+                    f"Yahoo Finance is rate-limiting requests. "
+                    f"Wait 30–60 seconds and try again. ({msg})"
+                )
+            else:
+                st.error(f"Could not fetch {ticker_input.upper()}: {msg}")
 
     if gemini_key and GEMINI_AVAILABLE and "stock" in st.session_state:
         with st.spinner("Getting Gemini hints…"):
