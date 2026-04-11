@@ -32,16 +32,31 @@ FMP_V3     = "https://financialmodelingprep.com/api/v3"
 
 def _load_toml_secrets() -> dict:
     """Read .streamlit/secrets.toml directly — no st.secrets dependency."""
+    import re
     path = Path(__file__).parent / ".streamlit" / "secrets.toml"
     if not path.exists():
         return {}
+    # Try stdlib tomllib (Python 3.11+), then tomli package, then manual parser
     try:
-        import tomllib
+        try:
+            import tomllib                          # Python 3.11+
+        except ImportError:
+            import tomli as tomllib                 # pip install tomli
         with open(path, "rb") as f:
             return tomllib.load(f)
+    except Exception:
+        pass
+    # Manual fallback: parse simple KEY = "VALUE" lines (no sections needed)
+    secrets: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'^\s*(\w+)\s*=\s*["\'](.+?)["\']\s*$', line)
+                if m:
+                    secrets[m.group(1)] = m.group(2)
     except Exception as e:
         logger.warning("Could not load secrets.toml: %s", e)
-        return {}
+    return secrets
 
 _SECRETS = _load_toml_secrets()
 
@@ -211,10 +226,11 @@ def fetch_stock_data(ticker: str, api_key: str) -> dict:
 
     sf = lambda v, d=None: float(v) if v not in (None, "", "N/A") else d
 
-    price  = sf(p.get("price"))
-    mkt_cap = sf(p.get("mktCap"), 0) / 1e9
+    price = sf(p.get("price"))
+    # FMP stable API uses "marketCap"; v3 uses "mktCap" — try both
+    mkt_cap = sf(p.get("marketCap") or p.get("mktCap"), 0) / 1e9
 
-    # Try every field name FMP has used across API versions
+    # Try every field name FMP has used across API versions for shares
     shares_raw = (p.get("sharesOutstanding")
                or p.get("outstandingShares")
                or p.get("commonStockSharesOutstanding")
@@ -296,14 +312,13 @@ Return ONLY valid JSON (no markdown, no explanation):
                 return json.loads(text)
             except json.JSONDecodeError as je:
                 # Bad JSON from this model — try the next one
-                last_exc = ValueError(f"Gemini returned invalid JSON: {je}")
+                last_exc = ValueError(f"Gemini [{model}] returned invalid JSON: {je}")
                 continue
         except Exception as e:
-            err = str(e)
-            if any(k in err for k in ("404", "NOT_FOUND", "no longer available", "unavailable")):
-                last_exc = e
-                continue
-            raise  # unexpected errors bubble up immediately
+            # Any failure (404, 429, 403, quota exceeded, etc.) → try next model
+            last_exc = e
+            logger.warning("Gemini model %s failed: %s", model, e)
+            continue
     raise last_exc or RuntimeError("All Gemini models exhausted")
 
 
