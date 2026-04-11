@@ -1,701 +1,599 @@
 #!/usr/bin/env python3
 """
-Stock Valuation Calculator
-Fundamental analysis tool with Gemini-powered field hints.
-
-Run:
-    streamlit run stock_valuation.py
+Stock Valuation Calculator — FMP + Gemini
+Run: streamlit run stock_valuation.py
 """
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 
-# ── Optional Gemini support ───────────────────────────────────────────────────
 try:
     from google import genai as google_genai
-
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
 
 SAVE_FILE = Path(__file__).parent / "saved_analyses.json"
+FMP_BASE  = "https://financialmodelingprep.com/api"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page config
+# Page config + CSS
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Stock Valuation Calculator",
-    page_icon="📈",
-    layout="wide",
-)
+st.set_page_config(page_title="Stock Valuation", page_icon="📈", layout="wide")
 
-st.markdown(
-    """
+st.markdown("""
 <style>
-.scenario-card {
-    border-radius: 12px;
-    padding: 18px;
-    margin: 6px 0;
-    text-align: center;
+/* ── global ── */
+[data-testid="stAppViewContainer"] { background: #0d1117; }
+[data-testid="stSidebar"]          { background: #161b22; border-right: 1px solid #30363d; }
+section.main > div                 { padding-top: 1.5rem; }
+
+/* ── company header card ── */
+.stock-header {
+    background: linear-gradient(135deg, #1c2333 0%, #161b22 100%);
+    border: 1px solid #30363d;
+    border-radius: 14px;
+    padding: 20px 26px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
 }
-.low-card  { background: rgba(239,68,68,0.08);  border: 1px solid rgba(239,68,68,0.35); }
-.base-card { background: rgba(251,146,60,0.08); border: 1px solid rgba(251,146,60,0.35); }
-.high-card { background: rgba(34,197,94,0.08);  border: 1px solid rgba(34,197,94,0.35); }
+.stock-header img  { width: 52px; height: 52px; border-radius: 10px; object-fit: contain; background:#fff; padding:4px; }
+.stock-header h2   { margin: 0; font-size: 1.35rem; color: #e6edf3; }
+.stock-header span { font-size: 0.8rem; color: #8b949e; }
+.sector-badge {
+    display: inline-block;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 0.73rem;
+    color: #8b949e;
+    margin-left: 6px;
+}
+
+/* ── metric pills (top row) ── */
+.metric-row { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+.metric-pill {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 10px 18px;
+    min-width: 120px;
+    flex: 1;
+}
+.metric-pill .label { font-size: 0.7rem; color: #8b949e; margin-bottom: 4px; }
+.metric-pill .value { font-size: 1.15rem; font-weight: 700; color: #e6edf3; }
+
+/* ── section headers ── */
+.section-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin: 18px 0 10px;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 6px;
+}
+
+/* ── hint boxes ── */
 .hint-box {
-    font-size: 0.76rem;
-    color: #94a3b8;
-    background: rgba(148,163,184,0.07);
-    border-left: 2px solid #475569;
-    padding: 4px 8px;
+    font-size: 0.72rem;
+    color: #8b949e;
+    background: #161b22;
+    border-left: 2px solid #388bfd;
+    padding: 4px 10px;
     border-radius: 0 6px 6px 0;
-    margin: -8px 0 14px 0;
+    margin: -6px 0 14px;
 }
+
+/* ── scenario cards ── */
+.sc-card {
+    border-radius: 12px;
+    padding: 20px 16px;
+    text-align: center;
+    height: 100%;
+}
+.sc-low  { background: rgba(248,81,73,.08);  border: 1px solid rgba(248,81,73,.35); }
+.sc-base { background: rgba(210,153,34,.08); border: 1px solid rgba(210,153,34,.35); }
+.sc-high { background: rgba(63,185,80,.08);  border: 1px solid rgba(63,185,80,.35); }
+.sc-card .sc-label  { font-size: 0.75rem; color: #8b949e; margin-bottom: 2px; }
+.sc-card .sc-value  { font-size: 1.3rem; font-weight: 800; color: #e6edf3; }
+.sc-card .sc-sub    { font-size: 0.9rem; font-weight: 600; color: #e6edf3; }
+.sc-card .sc-return { font-size: 1.1rem; font-weight: 700; }
+.sc-card hr         { border-color: #30363d; margin: 10px 0; }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data helpers
+# FMP helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_stock_data(ticker: str, max_retries: int = 4) -> dict:
-    last_exc = None
-    for attempt in range(max_retries):
-        if attempt > 0:
-            wait = 2 ** attempt  # 2s, 4s, 8s
-            time.sleep(wait)
-        try:
-            return _fetch_stock_data_once(ticker)
-        except Exception as exc:
-            last_exc = exc
-            msg = str(exc).lower()
-            # Only retry on rate-limit / network errors
-            if not any(k in msg for k in ("429", "rate", "too many", "timeout", "connection")):
-                raise
-    raise last_exc
+def fmp(endpoint: str, key: str, params: dict = None) -> any:
+    p = params or {}
+    p["apikey"] = key
+    r = requests.get(f"{FMP_BASE}/{endpoint}", params=p, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "Error Message" in data:
+        raise ValueError(data["Error Message"])
+    return data
 
 
-def _fetch_stock_data_once(ticker: str) -> dict:
-    t = yf.Ticker(ticker)
-    info = t.info or {}
-    if not info or info.get("trailingPE") is None and info.get("currentPrice") is None and info.get("regularMarketPrice") is None:
-        # yfinance sometimes returns an empty dict on rate limit without raising
-        raise Exception("Too Many Requests. Rate limited. Try after a while.")
+def fetch_stock_data(ticker: str, api_key: str) -> dict:
+    ticker = ticker.upper().strip()
 
-    # ── Historical revenue CAGR ──
+    profile_list = fmp(f"v3/profile/{ticker}", api_key)
+    if not profile_list:
+        raise ValueError(f"Ticker {ticker} not found.")
+    p = profile_list[0]
+
+    income = fmp("v3/income-statement/" + ticker, api_key, {"limit": 4})
+
+    analyst = []
+    try:
+        analyst = fmp("v3/analyst-estimates/" + ticker, api_key, {"limit": 5})
+    except Exception:
+        pass
+
+    # Revenue CAGR from income statements
     revenue_cagr = None
-    try:
-        fin = t.financials
-        if fin is not None and not fin.empty and "Total Revenue" in fin.index:
-            rev_series = fin.loc["Total Revenue"].dropna().sort_index(ascending=True)
-            if len(rev_series) >= 2:
-                oldest, newest = rev_series.iloc[0], rev_series.iloc[-1]
-                n = len(rev_series) - 1
-                if oldest > 0:
-                    revenue_cagr = (newest / oldest) ** (1 / n) - 1
-    except Exception:
-        pass
+    revenues = [r["revenue"] for r in income if r.get("revenue")]
+    if len(revenues) >= 2:
+        oldest, newest = revenues[-1], revenues[0]
+        n = len(revenues) - 1
+        if oldest > 0:
+            revenue_cagr = (newest / oldest) ** (1 / n) - 1
 
-    # ── Analyst 5-year EPS growth estimate ──
-    analyst_growth = None
-    try:
-        ge = t.growth_estimates
-        if ge is not None and not ge.empty:
-            col = ticker.upper()
-            if col in ge.columns and "5y" in ge.index:
-                val = ge.loc["5y", col]
-                if pd.notna(val):
-                    analyst_growth = float(val)
-    except Exception:
-        pass
+    # Analyst revenue growth (CAGR across estimate years)
+    analyst_rev_growth = None
+    est_revs = [a.get("estimatedRevenueAvg", 0) for a in analyst if a.get("estimatedRevenueAvg")]
+    if len(est_revs) >= 2:
+        r0, r1 = est_revs[-1], est_revs[0]
+        if r0 > 0:
+            analyst_rev_growth = (r1 / r0) ** (1 / (len(est_revs) - 1)) - 1
 
-    # ── Historical net margins ──
-    net_margins = []
-    try:
-        fin = t.financials
-        if fin is not None and not fin.empty:
-            if "Net Income" in fin.index and "Total Revenue" in fin.index:
-                ni = fin.loc["Net Income"]
-                rv = fin.loc["Total Revenue"]
-                for col in fin.columns:
-                    if pd.notna(ni.get(col)) and pd.notna(rv.get(col)) and rv[col] > 0:
-                        net_margins.append(float(ni[col] / rv[col]))
-    except Exception:
-        pass
+    # Net margins
+    margins = []
+    for row in income:
+        rev, ni = row.get("revenue", 0), row.get("netIncome", 0)
+        if rev and rev > 0:
+            margins.append(ni / rev)
 
-    safe_float = lambda v, default=None: (
-        float(v) if v is not None and not (isinstance(v, float) and v != v) else default
-    )
+    sf = lambda v, d=None: float(v) if v not in (None, "", "N/A") else d
 
     return {
-        "name": info.get("longName", ticker.upper()),
-        "ticker": ticker.upper(),
-        "current_price": safe_float(
-            info.get("currentPrice") or info.get("regularMarketPrice")
-        ),
-        "shares_outstanding": safe_float(info.get("sharesOutstanding"), 0) / 1e9,
-        "market_cap": safe_float(info.get("marketCap"), 0) / 1e9,
-        "ttm_revenue": safe_float(info.get("totalRevenue"), 0) / 1e9,
-        "pe_ratio": safe_float(info.get("trailingPE")),
-        "forward_pe": safe_float(info.get("forwardPE")),
-        "revenue_cagr_3yr": revenue_cagr,
-        "analyst_growth_5yr": analyst_growth,
-        "current_net_margin": net_margins[0] if net_margins else None,
-        "avg_net_margin_3yr": (
-            sum(net_margins[:3]) / len(net_margins[:3]) if net_margins else None
-        ),
-        "sector": info.get("sector", ""),
-        "industry": info.get("industry", ""),
+        "name":               p.get("companyName", ticker),
+        "ticker":             ticker,
+        "logo":               p.get("image", ""),
+        "sector":             p.get("sector", ""),
+        "industry":           p.get("industry", ""),
+        "current_price":      sf(p.get("price")),
+        "shares_outstanding": sf(p.get("sharesOutstanding"), 0) / 1e9,
+        "market_cap":         sf(p.get("mktCap"), 0) / 1e9,
+        "ttm_revenue":        sf(revenues[0] if revenues else None, 0) / 1e9,
+        "pe_ratio":           sf(p.get("pe")),
+        "revenue_cagr":       revenue_cagr,
+        "analyst_rev_growth": analyst_rev_growth,
+        "current_margin":     margins[0] if margins else None,
+        "avg_margin":         sum(margins[:3]) / len(margins[:3]) if margins else None,
     }
 
 
-def get_gemini_hints(stock_data: dict, api_key: str) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini hints
+# ─────────────────────────────────────────────────────────────────────────────
+GEMINI_MODELS = [
+    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
+def get_gemini_hints(s: dict, api_key: str) -> dict:
     client = google_genai.Client(api_key=api_key)
+    prompt = f"""You are a concise financial analyst. Given this data for {s['name']} ({s['ticker']}):
+Sector: {s.get('sector')} | Industry: {s.get('industry')}
+TTM Revenue: ${s.get('ttm_revenue',0):.1f}B
+3-yr Revenue CAGR: {f"{s['revenue_cagr']*100:.1f}%" if s.get('revenue_cagr') else 'N/A'}
+Analyst Revenue CAGR: {f"{s['analyst_rev_growth']*100:.1f}%" if s.get('analyst_rev_growth') else 'N/A'}
+TTM Net Margin: {f"{s['current_margin']*100:.1f}%" if s.get('current_margin') else 'N/A'}
+3yr Avg Margin: {f"{s['avg_margin']*100:.1f}%" if s.get('avg_margin') else 'N/A'}
+Trailing P/E: {s.get('pe_ratio') or 'N/A'}
 
-    pe = stock_data.get("pe_ratio")
-    fpe = stock_data.get("forward_pe")
-    cagr = stock_data.get("revenue_cagr_3yr")
-    margin = stock_data.get("current_net_margin")
-    avg_margin = stock_data.get("avg_net_margin_3yr")
-    ag = stock_data.get("analyst_growth_5yr")
+Write a SHORT hint (max 15 words) for each field. Cite the data. Be specific.
+Respond ONLY with valid JSON:
+{{"growth_rate":"...","margin":"...","pe_low":"...","pe_base":"...","pe_high":"..."}}"""
 
-    prompt = f"""You are a concise financial analyst.
-
-Stock: {stock_data['name']} ({stock_data['ticker']})
-Sector: {stock_data.get('sector', 'N/A')} | Industry: {stock_data.get('industry', 'N/A')}
-Current Price: ${stock_data.get('current_price', 'N/A')}
-TTM Revenue: ${stock_data.get('ttm_revenue', 0):.1f}B
-3-yr Revenue CAGR: {f"{cagr*100:.1f}%" if cagr else "N/A"}
-Analyst 5yr EPS growth: {f"{ag*100:.1f}%" if ag else "N/A"}
-TTM Net Margin: {f"{margin*100:.1f}%" if margin else "N/A"}
-3-yr Avg Net Margin: {f"{avg_margin*100:.1f}%" if avg_margin else "N/A"}
-Trailing P/E: {pe or "N/A"} | Forward P/E: {fpe or "N/A"}
-
-Write a SHORT hint (max 15 words) for each input field a user will fill in.
-Be specific, cite the data above where relevant.
-
-Respond ONLY with valid JSON (no markdown):
-{{"growth_rate":"...", "margin":"...", "pe_low":"...", "pe_base":"...", "pe_high":"..."}}"""
-
-    # Try models in preference order; fall back if one is unavailable
-    models_to_try = [
-        "gemini-2.5-flash-preview-04-17",
-        "gemini-2.5-pro-preview-03-25",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-    ]
-    response = None
     last_exc = None
-    for model_id in models_to_try:
+    for model in GEMINI_MODELS:
         try:
-            response = client.models.generate_content(model=model_id, contents=prompt)
-            break
-        except Exception as exc:
-            if "404" in str(exc) or "NOT_FOUND" in str(exc) or "no longer available" in str(exc).lower():
-                last_exc = exc
+            r = client.models.generate_content(model=model, contents=prompt)
+            text = r.text.strip()
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"): text = text[4:]
+                text = text.split("```")[0].strip()
+            return json.loads(text)
+        except Exception as e:
+            if any(k in str(e) for k in ("404", "NOT_FOUND", "no longer available")):
+                last_exc = e
                 continue
             raise
-    if response is None:
-        raise last_exc
-    text = response.text.strip()
-    # Strip possible markdown fences
-    if "```" in text:
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.split("```")[0].strip()
-    return json.loads(text)
-
-
-def hint(text: str):
-    """Render a styled hint box."""
-    if text:
-        st.markdown(
-            f'<div class="hint-box">💡 {text}</div>', unsafe_allow_html=True
-        )
+    raise last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Calculation helpers
+# Calculations
 # ─────────────────────────────────────────────────────────────────────────────
-def build_forecast(base_rev: float, growth: float, margin: float, start_year: int, n: int):
+def build_forecast(base_rev, growth_pct, margin_pct, start_year, n):
     rows = []
     for i in range(n + 1):
-        rev = base_rev * (1 + growth / 100) ** i
-        profit = rev * margin / 100
-        rows.append({"Year": start_year + i, "Revenue ($B)": rev, "Margin (%)": margin, "Profit ($B)": profit})
+        rev    = base_rev * (1 + growth_pct / 100) ** i
+        profit = rev * margin_pct / 100
+        rows.append({"Year": start_year + i, "Revenue ($B)": rev,
+                     "Margin (%)": margin_pct, "Profit ($B)": profit})
     return rows
 
 
-def build_scenarios(final_profit, pe_low, pe_base, pe_high, shares, current_price, n_years):
+def build_scenarios(profit, pe_low, pe_base, pe_high, shares, price, n):
     out = {}
     for label, pe in [("Low", pe_low), ("Base", pe_base), ("High", pe_high)]:
-        mkt_cap = final_profit * pe
-        tp = mkt_cap / shares if shares > 0 else 0
-        cagr = (tp / current_price) ** (1 / n_years) - 1 if current_price > 0 and n_years > 0 else 0
-        out[label] = {"pe": pe, "market_cap": mkt_cap, "target_price": tp, "annual_return": cagr * 100}
+        mc = profit * pe
+        tp = mc / shares if shares > 0 else 0
+        ar = ((tp / price) ** (1 / n) - 1) * 100 if price > 0 and n > 0 else 0
+        out[label] = {"pe": pe, "market_cap": mc, "target_price": tp, "annual_return": ar}
     return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
-def load_analyses() -> dict:
+def load_analyses():
     if SAVE_FILE.exists():
-        try:
-            return json.loads(SAVE_FILE.read_text())
-        except Exception:
-            return {}
+        try: return json.loads(SAVE_FILE.read_text())
+        except: return {}
     return {}
-
 
 def save_analysis(ticker, inputs, forecast, scenarios):
     data = load_analyses()
-    data[ticker] = {
-        "ticker": ticker,
-        "saved_at": datetime.now().isoformat(),
-        "inputs": inputs,
-        "forecast": forecast,
-        "scenarios": scenarios,
-    }
+    data[ticker] = {"ticker": ticker, "saved_at": datetime.now().isoformat(),
+                    "inputs": inputs, "forecast": forecast, "scenarios": scenarios}
     SAVE_FILE.write_text(json.dumps(data, indent=2))
+
+
+def hint(text):
+    if text:
+        st.markdown(f'<div class="hint-box">💡 {text}</div>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Settings")
-    gemini_key = st.text_input(
-        "Gemini API Key (optional)",
-        type="password",
-        help="Enables AI-powered hints for each input field",
-    )
+    st.markdown("### ⚙️ API Keys")
+    fmp_key    = st.text_input("FMP API Key",    value=os.environ.get("FMP_API_KEY", ""),
+                               type="password")
+    gemini_key = st.text_input("Gemini API Key (optional)",
+                               value=os.environ.get("GEMINI_API_KEY", ""), type="password")
     if not GEMINI_AVAILABLE:
-        st.caption("Install `google-genai` to enable Gemini hints.")
+        st.caption("Install `google-genai` for AI hints.")
 
     st.divider()
-    st.header("💾 Saved Analyses")
+    st.markdown("### 💾 Saved")
     analyses = load_analyses()
     if analyses:
-        for saved_ticker, saved_data in analyses.items():
+        for tk, sd in analyses.items():
             c1, c2 = st.columns([3, 1])
-            c1.write(f"**{saved_ticker}** — {saved_data['saved_at'][:10]}")
-            if c2.button("Load", key=f"load_{saved_ticker}"):
-                st.session_state["load_request"] = saved_ticker
+            c1.write(f"**{tk}** {sd['saved_at'][:10]}")
+            if c2.button("Load", key=f"load_{tk}"):
+                st.session_state["load_req"] = tk
     else:
         st.caption("No saved analyses yet.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📈 Stock Valuation Calculator")
-st.caption(
-    "Enter your assumptions → get revenue forecast + target price scenarios (Low / Base / High)."
-)
+st.markdown("## 📈 Stock Valuation Calculator")
+st.caption("Fundamental analysis · FMP data · Gemini AI hints")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ticker fetch bar
+# Ticker bar
 # ─────────────────────────────────────────────────────────────────────────────
 tc, bc = st.columns([4, 1])
 with tc:
-    ticker_input = st.text_input(
-        "Ticker", placeholder="e.g. GOOG, AAPL, MSFT, NVDA", label_visibility="collapsed"
-    )
+    ticker_input = st.text_input("Ticker", placeholder="GOOG · AAPL · AMZN · NVDA",
+                                 label_visibility="collapsed")
 with bc:
-    fetch_clicked = st.button("🔍 Fetch", use_container_width=True)
+    fetch_clicked = st.button("🔍 Fetch", use_container_width=True, type="primary")
 
-# ── Handle fetch ──────────────────────────────────────────────────────────────
+# ── Fetch ────────────────────────────────────────────────────────────────────
 if fetch_clicked and ticker_input.strip():
-    with st.spinner(f"Fetching {ticker_input.upper()}… (retries up to 3x on rate limit)"):
-        try:
-            st.session_state["stock"] = fetch_stock_data(ticker_input.strip())
-            st.session_state["hints"] = {}
-            st.session_state["prefill"] = {}
-        except Exception as exc:
-            msg = str(exc)
-            if any(k in msg.lower() for k in ("429", "rate", "too many")):
-                st.error(
-                    f"Yahoo Finance is rate-limiting requests. "
-                    f"Wait 30–60 seconds and try again. ({msg})"
-                )
-            else:
-                st.error(f"Could not fetch {ticker_input.upper()}: {msg}")
-
-    if gemini_key and GEMINI_AVAILABLE and "stock" in st.session_state:
-        with st.spinner("Getting Gemini hints…"):
+    if not fmp_key:
+        st.error("Add your FMP API key in the sidebar.")
+    else:
+        with st.spinner(f"Fetching {ticker_input.upper()}…"):
             try:
-                st.session_state["hints"] = get_gemini_hints(
-                    st.session_state["stock"], gemini_key
-                )
-            except Exception as exc:
-                st.warning(f"Gemini hints unavailable: {exc}")
+                st.session_state["stock"]   = fetch_stock_data(ticker_input, fmp_key)
+                st.session_state["hints"]   = {}
+                st.session_state["prefill"] = {}
+            except Exception as e:
+                st.error(str(e))
 
-# ── Handle load from sidebar ──────────────────────────────────────────────────
-if "load_request" in st.session_state:
-    req = st.session_state.pop("load_request")
+        if gemini_key and GEMINI_AVAILABLE and "stock" in st.session_state:
+            with st.spinner("Getting Gemini hints…"):
+                try:
+                    st.session_state["hints"] = get_gemini_hints(
+                        st.session_state["stock"], gemini_key)
+                except Exception as e:
+                    st.warning(f"Gemini hints unavailable: {e}")
+
+# ── Load saved ───────────────────────────────────────────────────────────────
+if "load_req" in st.session_state:
+    req = st.session_state.pop("load_req")
     if req in analyses:
-        saved = analyses[req]
-        st.session_state["stock"] = {
-            "ticker": req,
-            "name": req,
-            "current_price": None,
-            "shares_outstanding": 0,
-            "market_cap": 0,
-            "ttm_revenue": 0,
-            "pe_ratio": None,
-            "forward_pe": None,
-            "revenue_cagr_3yr": None,
-            "analyst_growth_5yr": None,
-            "current_net_margin": None,
-            "avg_net_margin_3yr": None,
-            "sector": "",
-            "industry": "",
-        }
-        st.session_state["hints"] = {}
-        st.session_state["prefill"] = saved["inputs"]
+        sv = analyses[req]
+        st.session_state["stock"]   = {"ticker": req, "name": req, "logo": "", "sector": "",
+                                        "industry": "", "current_price": None, "shares_outstanding": 0,
+                                        "market_cap": 0, "ttm_revenue": 0, "pe_ratio": None,
+                                        "revenue_cagr": None, "analyst_rev_growth": None,
+                                        "current_margin": None, "avg_margin": None}
+        st.session_state["hints"]   = {}
+        st.session_state["prefill"] = sv["inputs"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main panel — only shown after a stock is loaded
-# ─────────────────────────────────────────────────────────────────────────────
 if "stock" not in st.session_state:
-    st.info("Enter a ticker above and click Fetch to get started.")
+    st.info("Enter a ticker above and click **Fetch** to begin.")
     st.stop()
 
-stock: dict = st.session_state["stock"]
-hints: dict = st.session_state.get("hints", {})
-prefill: dict = st.session_state.get("prefill", {})
+# ─────────────────────────────────────────────────────────────────────────────
+# Company header
+# ─────────────────────────────────────────────────────────────────────────────
+s      = st.session_state["stock"]
+hints  = st.session_state.get("hints", {})
+prefill= st.session_state.get("prefill", {})
+
+logo_html = (f'<img src="{s["logo"]}" onerror="this.style.display=\'none\'">'
+             if s.get("logo") else "")
+sector_badge = (f'<span class="sector-badge">{s["sector"]}</span>' if s.get("sector") else "")
+st.markdown(f"""
+<div class="stock-header">
+  {logo_html}
+  <div>
+    <h2>{s['name']} <span style="color:#8b949e;font-size:1rem">({s['ticker']})</span>{sector_badge}</h2>
+    <span>{s.get('industry','')}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Metric pills
+mc  = s.get("market_cap", 0)
+pe  = s.get("pe_ratio")
+cpr = s.get("current_price")
+st.markdown(f"""
+<div class="metric-row">
+  <div class="metric-pill"><div class="label">Price</div>
+    <div class="value">${f"{cpr:.2f}" if cpr else "—"}</div></div>
+  <div class="metric-pill"><div class="label">Market Cap</div>
+    <div class="value">${f"{mc:.0f}B" if mc else "—"}</div></div>
+  <div class="metric-pill"><div class="label">TTM Revenue</div>
+    <div class="value">${f"{s.get('ttm_revenue',0):.1f}B"}</div></div>
+  <div class="metric-pill"><div class="label">P/E</div>
+    <div class="value">{f"{pe:.1f}" if pe else "—"}</div></div>
+  <div class="metric-pill"><div class="label">TTM Net Margin</div>
+    <div class="value">{f"{s['current_margin']*100:.1f}%" if s.get('current_margin') else "—"}</div></div>
+</div>
+""", unsafe_allow_html=True)
 
 st.divider()
-st.subheader(f"{stock['name']} ({stock['ticker']})")
-if stock.get("sector"):
-    st.caption(f"📍 {stock['sector']}  ·  {stock.get('industry', '')}")
-
-left, right = st.columns([5, 7], gap="large")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LEFT — Inputs
+# Two-column layout
 # ─────────────────────────────────────────────────────────────────────────────
+left, right = st.columns([4, 6], gap="large")
+
+# ── LEFT : Inputs ─────────────────────────────────────────────────────────────
 with left:
-    st.markdown("### 🎛️ Assumptions")
+    st.markdown('<div class="section-title">Stock Info</div>', unsafe_allow_html=True)
 
-    # ── Current Price ──
-    default_price = prefill.get("current_price") or stock.get("current_price") or 100.0
-    current_price = st.number_input(
-        "Current Price ($)",
+    cur_price = st.number_input("Current Price ($)",
         min_value=0.01,
-        value=float(round(default_price, 2)),
-        step=0.5,
-        help="Current market price per share — your entry point.",
-    )
-    if stock.get("current_price"):
-        hint(f"Market price: ${stock['current_price']:.2f}")
+        value=float(round(prefill.get("current_price") or cpr or 100, 2)),
+        step=1.0)
+    if cpr: hint(f"Market price: ${cpr:.2f}")
 
-    # ── Shares Outstanding ──
-    default_shares = prefill.get("shares") or stock.get("shares_outstanding") or 1.0
-    shares = st.number_input(
-        "Shares Outstanding (B)",
-        min_value=0.001,
-        value=float(round(default_shares, 3)),
-        step=0.01,
-        format="%.3f",
-        help="Total diluted shares outstanding in billions — used to convert market cap to per-share price.",
-    )
-    mkt_hint = ""
-    if stock.get("shares_outstanding"):
-        mkt_hint = f"{stock['shares_outstanding']:.2f}B diluted shares"
-        if stock.get("market_cap"):
-            mkt_hint += f"  |  Mkt Cap: ${stock['market_cap']:.0f}B"
-    if mkt_hint:
-        hint(mkt_hint)
+    shares = st.number_input("Shares Outstanding (B)",
+        min_value=0.001, format="%.3f",
+        value=float(round(prefill.get("shares") or s.get("shares_outstanding") or 1, 3)),
+        step=0.01)
+    if s.get("shares_outstanding"):
+        hint(f"{s['shares_outstanding']:.2f}B diluted shares · Mkt Cap ${mc:.0f}B")
 
-    # ── Base Revenue ──
-    default_rev = prefill.get("base_revenue") or stock.get("ttm_revenue") or 10.0
-    base_revenue = st.number_input(
-        "Base Revenue ($B)",
+    base_rev = st.number_input("Base Revenue ($B)",
         min_value=0.01,
-        value=float(round(default_rev, 2)),
-        step=1.0,
-        help="Starting revenue for the forecast — typically TTM or latest FY revenue.",
-    )
-    if stock.get("ttm_revenue"):
-        hint(f"TTM Revenue: ${stock['ttm_revenue']:.1f}B")
+        value=float(round(prefill.get("base_revenue") or s.get("ttm_revenue") or 10, 2)),
+        step=1.0)
+    if s.get("ttm_revenue"): hint(f"TTM Revenue: ${s['ttm_revenue']:.1f}B")
 
-    # ── Revenue Growth Rate ──
-    cagr_val = stock.get("revenue_cagr_3yr")
-    ag_val = stock.get("analyst_growth_5yr")
+    st.markdown('<div class="section-title">Growth Assumptions</div>', unsafe_allow_html=True)
+
+    cagr_val = s.get("revenue_cagr")
+    ag_val   = s.get("analyst_rev_growth")
     default_growth = prefill.get("growth_rate") or (cagr_val * 100 if cagr_val else 10.0)
-
-    growth_hint_text = hints.get("growth_rate", "")
-    if not growth_hint_text:
-        parts = []
-        if cagr_val:
-            parts.append(f"3-yr Revenue CAGR: {cagr_val*100:.1f}%")
-        if ag_val:
-            parts.append(f"Analyst 5yr EPS est: {ag_val*100:.1f}%")
-        growth_hint_text = "  |  ".join(parts)
-
-    growth_rate = st.number_input(
-        "Revenue Growth Rate (% / yr)",
-        min_value=0.0,
-        max_value=200.0,
+    growth_hint = hints.get("growth_rate") or "  |  ".join(filter(None, [
+        f"3-yr CAGR: {cagr_val*100:.1f}%" if cagr_val else None,
+        f"Analyst est: {ag_val*100:.1f}%" if ag_val else None,
+    ]))
+    growth = st.number_input("Revenue Growth Rate (% / yr)",
+        min_value=0.0, max_value=200.0, step=0.5,
         value=float(round(default_growth, 1)),
-        step=0.5,
-        help=growth_hint_text or "Your projected annual revenue growth rate.",
-    )
-    hint(growth_hint_text)
+        help=growth_hint or "Your projected annual revenue growth.")
+    hint(growth_hint)
 
-    # ── Net Margin ──
-    cur_margin = stock.get("current_net_margin")
-    avg_margin = stock.get("avg_net_margin_3yr")
-    default_margin = prefill.get("margin") or (cur_margin * 100 if cur_margin else 20.0)
-
-    margin_hint_text = hints.get("margin", "")
-    if not margin_hint_text:
-        parts = []
-        if cur_margin:
-            parts.append(f"TTM Net Margin: {cur_margin*100:.1f}%")
-        if avg_margin:
-            parts.append(f"3-yr avg: {avg_margin*100:.1f}%")
-        margin_hint_text = "  |  ".join(parts)
-
-    margin = st.number_input(
-        "Net Profit Margin (%)",
-        min_value=0.0,
-        max_value=100.0,
+    cm_val = s.get("current_margin")
+    am_val = s.get("avg_margin")
+    default_margin = prefill.get("margin") or (cm_val * 100 if cm_val else 20.0)
+    margin_hint = hints.get("margin") or "  |  ".join(filter(None, [
+        f"TTM Margin: {cm_val*100:.1f}%" if cm_val else None,
+        f"3-yr avg: {am_val*100:.1f}%" if am_val else None,
+    ]))
+    margin = st.number_input("Net Profit Margin (%)",
+        min_value=0.0, max_value=100.0, step=0.5,
         value=float(round(default_margin, 1)),
-        step=0.5,
-        help=margin_hint_text or "Net profit as % of revenue at the target year.",
-    )
-    hint(margin_hint_text)
+        help=margin_hint or "Net profit as % of revenue at target year.")
+    hint(margin_hint)
 
-    # ── Projection Years ──
     start_year = datetime.now().year
-    n_years = st.slider("Projection Years", 1, 10, int(prefill.get("n_years", 5)))
-    target_year = start_year + n_years
-    st.caption(f"Forecast: {start_year} → {target_year}")
+    n_years    = st.slider("Projection Years", 1, 10, int(prefill.get("n_years", 5)))
+    st.caption(f"Forecast: **{start_year}** → **{start_year + n_years}**")
 
-    st.markdown("---")
-    st.markdown("**Valuation Multiples (P/E)**")
+    st.markdown('<div class="section-title">Valuation Multiples (P/E)</div>', unsafe_allow_html=True)
 
-    pe_ratio = stock.get("pe_ratio")
-    fwd_pe = stock.get("forward_pe")
-    pe_hint_text = ""
-    if pe_ratio:
-        pe_hint_text = f"Trailing P/E: {pe_ratio:.1f}"
-        if fwd_pe:
-            pe_hint_text += f"  |  Fwd P/E: {fwd_pe:.1f}"
+    pe_hint = hints.get("pe_low") or (f"Current P/E: {pe:.1f}" if pe else "")
+    pe_low  = st.number_input("Low Multiple",  min_value=1, value=int(prefill.get("pe_low", 20)),
+                               help=pe_hint or "Conservative scenario.")
+    pe_base = st.number_input("Base Multiple", min_value=1, value=int(prefill.get("pe_base", 25)),
+                               help=hints.get("pe_base") or "Fair-value scenario.")
+    pe_high = st.number_input("High Multiple", min_value=1, value=int(prefill.get("pe_high", 30)),
+                               help=hints.get("pe_high") or "Optimistic scenario.")
+    if pe_hint: hint(pe_hint)
 
-    default_pe_low  = int(prefill.get("pe_low",  20))
-    default_pe_base = int(prefill.get("pe_base", 25))
-    default_pe_high = int(prefill.get("pe_high", 30))
-
-    pe_low = st.number_input(
-        "Low Multiple",
-        min_value=1,
-        value=default_pe_low,
-        help=hints.get("pe_low") or "Conservative scenario — what the market might assign in a pessimistic outlook.",
-    )
-    pe_base = st.number_input(
-        "Base Multiple",
-        min_value=1,
-        value=default_pe_base,
-        help=hints.get("pe_base") or "Fair-value scenario — typical multiple for this sector/quality.",
-    )
-    pe_high = st.number_input(
-        "High Multiple",
-        min_value=1,
-        value=default_pe_high,
-        help=hints.get("pe_high") or "Optimistic scenario — premium multiple if growth exceeds expectations.",
-    )
-    if pe_hint_text:
-        hint(pe_hint_text)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RIGHT — Results
-# ─────────────────────────────────────────────────────────────────────────────
+# ── RIGHT : Results ───────────────────────────────────────────────────────────
 with right:
-    if base_revenue <= 0 or shares <= 0 or current_price <= 0:
-        st.info("Complete the inputs on the left to see the forecast.")
+    if base_rev <= 0 or shares <= 0 or cur_price <= 0:
+        st.info("Complete inputs on the left to see the forecast.")
         st.stop()
 
-    forecast_rows = build_forecast(base_revenue, growth_rate, margin, start_year, n_years)
-    final_profit = forecast_rows[-1]["Profit ($B)"]
-    scenarios = build_scenarios(final_profit, pe_low, pe_base, pe_high, shares, current_price, n_years)
+    forecast  = build_forecast(base_rev, growth, margin, start_year, n_years)
+    scenarios = build_scenarios(forecast[-1]["Profit ($B)"],
+                                pe_low, pe_base, pe_high, shares, cur_price, n_years)
 
     # ── Forecast table ────────────────────────────────────────
-    st.markdown("### 📊 Revenue & Profit Forecast")
-    df_display = pd.DataFrame(forecast_rows).set_index("Year")
-    df_display["Revenue ($B)"] = df_display["Revenue ($B)"].map("{:.2f}".format)
-    df_display["Margin (%)"]   = df_display["Margin (%)"].map("{:.1f}%".format)
-    df_display["Profit ($B)"]  = df_display["Profit ($B)"].map("{:.2f}".format)
-    st.dataframe(df_display, use_container_width=True)
+    st.markdown('<div class="section-title">Revenue & Profit Forecast</div>', unsafe_allow_html=True)
+    df = pd.DataFrame(forecast).set_index("Year")
+    df["Revenue ($B)"] = df["Revenue ($B)"].map("{:.2f}".format)
+    df["Margin (%)"]   = df["Margin (%)"].map("{:.1f}%".format)
+    df["Profit ($B)"]  = df["Profit ($B)"].map("{:.2f}".format)
+    st.dataframe(df, use_container_width=True)
 
-    # ── Revenue + Profit bar chart ────────────────────────────
-    raw_years   = [r["Year"]          for r in forecast_rows]
-    raw_revs    = [r["Revenue ($B)"]  for r in forecast_rows]
-    raw_profits = [r["Profit ($B)"]   for r in forecast_rows]
+    # ── Bar chart ─────────────────────────────────────────────
+    yrs  = [r["Year"]         for r in forecast]
+    revs = [r["Revenue ($B)"] for r in forecast]
+    prfs = [r["Profit ($B)"]  for r in forecast]
 
-    fig_rev = go.Figure()
-    fig_rev.add_trace(go.Bar(x=raw_years, y=raw_revs,    name="Revenue", marker_color="#3b82f6", opacity=0.65))
-    fig_rev.add_trace(go.Bar(x=raw_years, y=raw_profits, name="Profit",  marker_color="#22c55e", opacity=0.9))
-    fig_rev.update_layout(
-        barmode="overlay",
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=1.1),
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=yrs, y=revs, name="Revenue", marker_color="#388bfd", opacity=0.6))
+    fig.add_trace(go.Bar(x=yrs, y=prfs, name="Profit",  marker_color="#3fb950", opacity=0.9))
+    fig.update_layout(barmode="overlay", height=220,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.15, font_color="#8b949e"),
         margin=dict(t=10, b=10, l=0, r=0),
-        height=230,
-        yaxis_title="$B",
-        xaxis=dict(tickmode="linear", dtick=1),
-    )
-    st.plotly_chart(fig_rev, use_container_width=True)
+        yaxis=dict(title="$B", gridcolor="#21262d", color="#8b949e"),
+        xaxis=dict(tickmode="linear", dtick=1, color="#8b949e"))
+    st.plotly_chart(fig, use_container_width=True)
 
     # ── Scenario cards ────────────────────────────────────────
-    st.markdown("### 🎯 Target Price Scenarios")
-    card_meta = {
-        "Low":  ("🔴", "low"),
-        "Base": ("🟠", "base"),
-        "High": ("🟢", "high"),
-    }
+    st.markdown('<div class="section-title">Target Price Scenarios</div>', unsafe_allow_html=True)
     c_low, c_base, c_high = st.columns(3)
-    for col, (label, (emoji, css)) in zip(
-        [c_low, c_base, c_high], card_meta.items()
-    ):
-        d = scenarios[label]
-        ret_color = "#22c55e" if d["annual_return"] >= 0 else "#ef4444"
-        ret_str = f"{'+'if d['annual_return']>=0 else ''}{d['annual_return']:.1f}%"
+    card_cfg = [
+        (c_low,  "Low",  "sc-low",  "🔴", "#f85149"),
+        (c_base, "Base", "sc-base", "🟡", "#d2a520"),
+        (c_high, "High", "sc-high", "🟢", "#3fb950"),
+    ]
+    for col, label, css, emoji, ret_color in card_cfg:
+        d   = scenarios[label]
+        ret = d["annual_return"]
+        ret_str = f"{'+'if ret>=0 else ''}{ret:.1f}%"
         with col:
-            st.markdown(
-                f"""
-<div class="scenario-card {css}-card">
-  <div style="font-weight:700;font-size:1rem;margin-bottom:10px">{emoji} {label}</div>
-  <div style="color:#94a3b8;font-size:0.72rem">P/E Multiple</div>
-  <div style="font-size:1.3rem;font-weight:700">{d['pe']}x</div>
-  <br>
-  <div style="color:#94a3b8;font-size:0.72rem">Target Price</div>
-  <div style="font-size:1.5rem;font-weight:800">${d['target_price']:.1f}</div>
-  <br>
-  <div style="color:#94a3b8;font-size:0.72rem">Est. Market Cap</div>
-  <div style="font-weight:600">${d['market_cap']:.0f}B</div>
-  <br>
-  <div style="color:#94a3b8;font-size:0.72rem">Annual Return</div>
-  <div style="font-size:1.2rem;font-weight:700;color:{ret_color}">{ret_str}</div>
-</div>
-""",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"""
+<div class="sc-card {css}">
+  <div style="font-weight:700;font-size:0.95rem;margin-bottom:12px">{emoji} {label}</div>
+  <div class="sc-label">P/E Multiple</div>
+  <div class="sc-value">{d['pe']}x</div>
+  <hr>
+  <div class="sc-label">Target Price</div>
+  <div style="font-size:1.6rem;font-weight:800;color:#e6edf3">${d['target_price']:.1f}</div>
+  <hr>
+  <div class="sc-label">Est. Market Cap</div>
+  <div class="sc-sub">${d['market_cap']:.0f}B</div>
+  <hr>
+  <div class="sc-label">Annual Return ({n_years}yr)</div>
+  <div class="sc-return" style="color:{ret_color}">{ret_str}</div>
+</div>""", unsafe_allow_html=True)
 
-    # ── Price target range chart ──────────────────────────────
-    st.markdown("### 📉 Price Target Range")
+    # ── Price range chart ─────────────────────────────────────
+    st.markdown('<div class="section-title">Price Target Range</div>', unsafe_allow_html=True)
     labels = list(scenarios.keys())
-    prices = [scenarios[s]["target_price"] for s in labels]
-    colors = ["#ef4444", "#f97316", "#22c55e"]
-
-    fig_tp = go.Figure()
-    fig_tp.add_trace(
-        go.Bar(
-            x=labels,
-            y=prices,
-            marker_color=colors,
-            text=[f"${p:.1f}" for p in prices],
-            textposition="outside",
-        )
-    )
-    fig_tp.add_hline(
-        y=current_price,
-        line_dash="dash",
-        line_color="#94a3b8",
-        annotation_text=f"  Current ${current_price:.1f}",
-        annotation_position="right",
-    )
-    fig_tp.update_layout(
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(t=30, b=10, l=0, r=80),
-        height=280,
-        yaxis_title="Price ($)",
-        showlegend=False,
-    )
-    st.plotly_chart(fig_tp, use_container_width=True)
+    prices = [scenarios[l]["target_price"] for l in labels]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(x=labels, y=prices,
+        marker_color=["#f85149", "#d2a520", "#3fb950"],
+        text=[f"${p:.1f}" for p in prices], textposition="outside",
+        textfont=dict(color="#e6edf3")))
+    fig2.add_hline(y=cur_price, line_dash="dash", line_color="#8b949e",
+        annotation_text=f"  Current ${cur_price:.1f}",
+        annotation_font_color="#8b949e", annotation_position="right")
+    fig2.update_layout(height=260,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=30, b=10, l=0, r=80), showlegend=False,
+        yaxis=dict(title="Price ($)", gridcolor="#21262d", color="#8b949e"),
+        xaxis=dict(color="#8b949e"))
+    st.plotly_chart(fig2, use_container_width=True)
 
     # ── Save ──────────────────────────────────────────────────
     if st.button("💾 Save Analysis", use_container_width=True):
-        inputs_snapshot = {
-            "current_price": current_price,
-            "shares": shares,
-            "base_revenue": base_revenue,
-            "growth_rate": growth_rate,
-            "margin": margin,
-            "n_years": n_years,
-            "pe_low": int(pe_low),
-            "pe_base": int(pe_base),
-            "pe_high": int(pe_high),
-        }
-        save_analysis(stock["ticker"], inputs_snapshot, forecast_rows, scenarios)
-        st.success(f"✅ Saved analysis for {stock['ticker']}")
+        save_analysis(s["ticker"],
+            {"current_price": cur_price, "shares": shares, "base_revenue": base_rev,
+             "growth_rate": growth, "margin": margin, "n_years": n_years,
+             "pe_low": int(pe_low), "pe_base": int(pe_base), "pe_high": int(pe_high)},
+            [dict(r) for r in forecast], scenarios)
+        st.success(f"✅ Saved {s['ticker']}")
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Comparison section
+# Comparison
 # ─────────────────────────────────────────────────────────────────────────────
 analyses = load_analyses()
 if len(analyses) >= 2:
     st.divider()
     with st.expander("⚖️ Compare Saved Analyses", expanded=False):
-        selected = st.multiselect(
-            "Select stocks to compare",
-            list(analyses.keys()),
-            default=list(analyses.keys())[:4],
-        )
+        selected = st.multiselect("Stocks", list(analyses.keys()),
+                                  default=list(analyses.keys())[:4])
         if selected:
-            comp_cols = st.columns(len(selected))
-            for col, ticker_key in zip(comp_cols, selected):
-                saved = analyses[ticker_key]
-                inp = saved["inputs"]
-                sc = saved["scenarios"]
+            cols = st.columns(len(selected))
+            for col, tk in zip(cols, selected):
+                sv  = analyses[tk]
+                inp = sv["inputs"]
+                sc  = sv["scenarios"]
                 with col:
-                    st.markdown(f"#### {ticker_key}")
-                    st.caption(saved["saved_at"][:10])
-                    st.metric("Growth Rate", f"{inp.get('growth_rate', 0):.1f}%/yr")
-                    st.metric("Margin",      f"{inp.get('margin', 0):.1f}%")
-                    st.markdown("**Target Prices**")
-                    for scenario_label, sdata in sc.items():
-                        ret = sdata["annual_return"]
-                        st.metric(
-                            label=f"{scenario_label} ({sdata['pe']}x P/E)",
-                            value=f"${sdata['target_price']:.1f}",
-                            delta=f"{'+'if ret>=0 else ''}{ret:.1f}%/yr",
-                        )
+                    st.markdown(f"#### {tk}")
+                    st.caption(sv["saved_at"][:10])
+                    st.metric("Growth", f"{inp.get('growth_rate',0):.1f}%/yr")
+                    st.metric("Margin", f"{inp.get('margin',0):.1f}%")
+                    for lbl, d in sc.items():
+                        ret = d["annual_return"]
+                        st.metric(f"{lbl} ({d['pe']}x)",
+                                  f"${d['target_price']:.1f}",
+                                  f"{'+'if ret>=0 else ''}{ret:.1f}%/yr")
 
-            # Side-by-side target price chart
-            fig_comp = go.Figure()
-            bar_colors_comp = ["#ef4444", "#f97316", "#22c55e"]
-            for sc_label, bar_color in zip(["Low", "Base", "High"], bar_colors_comp):
-                fig_comp.add_trace(
-                    go.Bar(
-                        name=sc_label,
-                        x=selected,
-                        y=[analyses[t]["scenarios"][sc_label]["target_price"] for t in selected],
-                        marker_color=bar_color,
-                        opacity=0.85,
-                    )
-                )
-            fig_comp.update_layout(
-                barmode="group",
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                legend=dict(orientation="h"),
-                margin=dict(t=10, b=10),
-                height=300,
-                yaxis_title="Target Price ($)",
-            )
-            st.plotly_chart(fig_comp, use_container_width=True)
+            fig3 = go.Figure()
+            for lbl, clr in [("Low","#f85149"),("Base","#d2a520"),("High","#3fb950")]:
+                fig3.add_trace(go.Bar(name=lbl, x=selected,
+                    y=[analyses[t]["scenarios"][lbl]["target_price"] for t in selected],
+                    marker_color=clr, opacity=0.85))
+            fig3.update_layout(barmode="group", height=280,
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", font_color="#8b949e"),
+                yaxis=dict(title="Target Price ($)", gridcolor="#21262d", color="#8b949e"),
+                xaxis=dict(color="#8b949e"), margin=dict(t=10, b=10))
+            st.plotly_chart(fig3, use_container_width=True)

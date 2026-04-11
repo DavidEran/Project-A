@@ -2,7 +2,7 @@
 streamlit>=1.32.0
 
 # Stock Valuation Calculator
-yfinance>=0.2.40
+requests>=2.31.0
 pandas>=2.0.0
 plotly>=5.20.0
 google-genai>=1.0.0          # optional — Gemini-powered field hints
